@@ -54,6 +54,9 @@ Pendant une reunion, Nemotron multilingue affiche une previsualisation locale
 francaise ou anglaise environ toutes les 2,24 secondes. Ce texte en cours est
 egalement un vrai transcript exploitable : il est decoupe en segments d'environ
 20 secondes, horodate et mis a jour dans SQLite avec la source `realtime`.
+Cette segmentation reste invisible pendant la capture : l'interface presente
+un seul texte continu avec un curseur discret, sans repeter le nom de la source
+ni l'horodatage. La vue structuree reapparait apres la consolidation finale.
 Les boutons IA peuvent donc le consommer avant la fin de la reunion. Les memes
 echantillons sont d'abord synchronises dans le journal WAV durable. Pendant la
 capture, Nemotron reste le seul moteur d'inference actif afin de conserver une latence reguliere.

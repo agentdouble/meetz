@@ -197,10 +197,8 @@ struct MeetingRootView: View {
                                         .id(segment.id)
                                 }
                             } else {
-                                ForEach(controller.realtimeSegments) { segment in
-                                    RealtimeTranscriptSegmentView(segment: segment)
-                                        .id(segment.id)
-                                }
+                                LiveTranscriptView(segments: controller.realtimeSegments)
+                                    .id("live-transcript")
                             }
                         }
                         .padding(32)
@@ -212,9 +210,9 @@ struct MeetingRootView: View {
                             withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
                         }
                     }
-                    .onChange(of: controller.realtimeSegments.last?.text) {
-                        if let last = controller.realtimeSegments.last {
-                            proxy.scrollTo(last.id, anchor: .bottom)
+                    .onChange(of: controller.realtimeSegments.map(\.text)) {
+                        if !controller.realtimeSegments.isEmpty {
+                            proxy.scrollTo("live-transcript", anchor: .bottom)
                         }
                     }
                 }
@@ -661,40 +659,6 @@ private struct EditableSpeakerLabel: View {
     private func cancel() {
         draftName = displayName
         isEditing = false
-    }
-}
-
-private struct RealtimeTranscriptSegmentView: View {
-    let segment: TranscriptSegment
-
-    var body: some View {
-        HStack(alignment: .top, spacing: 16) {
-            Text(formatTime(segment.startTime))
-                .font(.system(size: 11, design: .monospaced))
-                .foregroundStyle(.secondary)
-                .frame(width: 48, alignment: .trailing)
-
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 8) {
-                    Text(segment.speakerName.uppercased())
-                        .tracking(0.8)
-                    Text("DIRECT")
-                        .foregroundStyle(.secondary)
-                }
-                .font(.system(size: 11, weight: .semibold, design: .monospaced))
-
-                Text(segment.text)
-                    .font(.body)
-                    .textSelection(.enabled)
-                    .lineSpacing(3)
-            }
-        }
-    }
-
-    private func formatTime(_ seconds: TimeInterval) -> String {
-        let minutes = Int(seconds) / 60
-        let remainingSeconds = Int(seconds) % 60
-        return String(format: "%02d:%02d", minutes, remainingSeconds)
     }
 }
 

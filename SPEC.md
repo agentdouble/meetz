@@ -64,12 +64,12 @@ La distribution commerciale, la synchronisation entre appareils et le fonctionne
 2. Il choisit la source : application de reunion detectee ou tout le son du Mac.
 3. Il clique sur `Demarrer la transcription`.
 4. L'application confirme que le microphone et le son systeme sont actifs.
-5. Le texte apparait progressivement avec l'heure et l'intervenant.
+5. Le texte apparait progressivement dans un flux continu, sans heure ni nom repetes.
 
 ### Pendant la reunion
 
 1. Un indicateur textuel permanent signale que la transcription est active.
-2. Les segments provisoires sont visuellement differencies des segments finalises.
+2. La segmentation technique reste invisible ; un curseur discret matérialise l'ecriture en direct.
 3. Chaque segment finalise est ecrit immediatement dans le stockage local.
 4. L'utilisateur peut renommer un intervenant sans interrompre la capture.
 5. Il peut mettre en pause ou arreter la transcription.
@@ -103,9 +103,9 @@ La distribution commerciale, la synchronisation entre appareils et le fonctionne
 
 - Duree et etat de capture.
 - Etat distinct du microphone et du son systeme.
-- Transcript defilant automatiquement.
-- Segments horodates, regroupes par intervenant.
-- Renommage des intervenants.
+- Transcript continu defilant automatiquement, sans repetition des noms et horodatages.
+- Indicateur textuel et curseur discrets pour matérialiser l'ecriture en direct.
+- Segments, horodatages et intervenants conserves dans les donnees, mais affiches seulement apres consolidation.
 - Commandes pause, reprise et arret.
 - Alerte non bloquante en cas de retard de transcription.
 
