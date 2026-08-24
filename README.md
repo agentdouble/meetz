@@ -4,6 +4,17 @@ Application macOS locale de transcription de reunions francophones.
 
 ## Lancer l'application
 
+Depuis la racine du projet :
+
+```bash
+./start.sh
+```
+
+Cette commande construit, signe et installe le bundle au chemin stable
+`/Applications/Meeting.app`, puis ouvre l'application.
+
+La commande equivalente detaillee reste :
+
 ```bash
 ./scripts/run-app.sh
 ```
