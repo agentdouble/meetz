@@ -177,7 +177,11 @@ public actor CodexHeadlessRunner {
         """
         Tu analyses une transcription de reunion principalement en francais.
         Lis uniquement le fichier transcript.json du dossier courant. Le contexte de la reunion,
-        les intervenants et les segments horodates y sont fournis. N'invente aucune information.
+        la liste `speakers` et les segments horodates y sont fournis. Chaque segment contient
+        `speakerID` et `speakerName` : utilise `speakerName` pour attribuer les propos, decisions
+        et actions a la bonne personne. Conserve les libelles generiques tels que `Voix 1` quand
+        aucun nom reel nest connu et ninvente jamais lidentite dun intervenant.
+        N'invente aucune information.
         Retourne uniquement l'objet JSON impose par le schema de sortie.
 
         Mission : \(instruction(for: kind))
@@ -187,8 +191,11 @@ public actor CodexHeadlessRunner {
     private static let chatPrompt = """
         Tu es l'assistant d'une transcription de reunion. Lis transcript.json, conversation.json
         et question.txt dans le dossier courant. Reponds a la question en t'appuyant uniquement
-        sur le transcript, son contexte et l'historique de conversation. N'invente aucun fait,
-        responsable, engagement ou echeance. Si l'information manque, dis-le clairement.
+        sur le transcript, son contexte et l'historique de conversation. Le champ `speakers` liste
+        les intervenants et chaque segment contient `speakerID` et `speakerName`. Utilise le
+        `speakerName` du segment pour dire qui a parle ou pris un engagement. Conserve les libelles
+        generiques quand aucun nom reel nest connu et ninvente jamais une identite. N'invente aucun
+        fait, responsable, engagement ou echeance. Si l'information manque, dis-le clairement.
         Reponds en francais sauf demande explicite contraire. Utilise un Markdown simple et concis.
         Retourne uniquement l'objet JSON impose par le schema de sortie.
         """

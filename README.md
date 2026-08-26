@@ -174,6 +174,12 @@ sortie est contrainte par un schema JSON, validee, puis conservee localement
 avec la reunion. L'historique du chat est lui aussi stocke dans SQLite. Aucun
 audio n'est transmis.
 
+L'export fournit une liste `speakers` dedupliquee et conserve aussi `speakerID`
+et `speakerName` sur chaque segment horodate. Codex peut ainsi attribuer une
+phrase, une decision ou une action a l'intervenant qui l'a prononcee. Un nom
+renomme dans Meeting est utilise lors de l'appel suivant ; une etiquette
+generique reste generique et Codex ne doit pas en inventer l'identite.
+
 Controle reel du runner sur un transcript synthetique :
 
 ```bash

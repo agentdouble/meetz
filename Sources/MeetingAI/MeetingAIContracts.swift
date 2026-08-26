@@ -38,18 +38,6 @@ public struct CodexRunConfiguration: Sendable, Equatable {
     }
 }
 
-public struct MeetingAITranscriptExport: Codable, Sendable {
-    public let schemaVersion: Int
-    public let meeting: MeetingRecord
-    public let segments: [TranscriptSegment]
-
-    public init(meeting: MeetingRecord, segments: [TranscriptSegment]) {
-        schemaVersion = 2
-        self.meeting = meeting
-        self.segments = segments
-    }
-}
-
 public struct MeetingAIChatHistoryExport: Codable, Sendable {
     public let schemaVersion: Int
     public let messages: [MeetingAIChatMessage]

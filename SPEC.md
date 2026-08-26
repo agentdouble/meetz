@@ -330,6 +330,13 @@ Obsidian reste un ensemble de notes Markdown structurees. Une vue Obsidian Bases
 - Les reglages permettent de choisir le modele Codex et leffort de raisonnement. Ces options sappliquent aussi au titre et au resume automatiques.
 - `codex exec` reste ephemere, en sandbox lecture seule, avec une sortie JSON validee ; aucun fichier audio nest transmis.
 
+### Attribution des intervenants dans Codex implementee le 2026-08-26
+
+- L'export de transcript schema v3 contient une liste `speakers` dedupliquee en ordre de premiere apparition.
+- Chaque segment conserve son `speakerID` stable et son `speakerName` courant afin que Codex puisse repondre a une question du type « qui a dit quoi ? ».
+- Les prompts du chat et des traitements structures exigent l'attribution par `speakerName`, conservent les etiquettes generiques et interdisent d'inventer une identite.
+- Le controle reel du runner utilise Alice et Bob et refuse la reponse si Codex n'attribue pas explicitement le budget a Alice.
+
 ### Reprise d'une reunion terminee implementee le 2026-08-26
 
 - Le bouton `Reprendre` rouvre atomiquement la reunion selectionnee au lieu de creer un second transcript.
