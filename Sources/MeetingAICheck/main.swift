@@ -21,15 +21,34 @@ let segment = TranscriptSegment(
 )
 
 do {
-    let output = try await CodexHeadlessRunner().run(
+    let runner = CodexHeadlessRunner()
+    let configuration = CodexRunConfiguration(
+        model: ProcessInfo.processInfo.environment["MEETING_CODEX_MODEL"] ?? "",
+        reasoningEffort: ProcessInfo.processInfo.environment["MEETING_CODEX_EFFORT"]
+            .flatMap(CodexReasoningEffort.init(rawValue:))
+            ?? .inherit
+    )
+    let transcript = MeetingAITranscriptExport(meeting: meeting, segments: [segment])
+    let output = try await runner.run(
         kind: .questions,
-        transcript: MeetingAITranscriptExport(meeting: meeting, segments: [segment]),
-        executablePath: executablePath
+        transcript: transcript,
+        executablePath: executablePath,
+        configuration: configuration
     )
     guard case let .questions(questions) = output, !questions.isEmpty else {
         throw MeetingAIError.invalidOutput("Aucune question n'a ete retournee.")
     }
-    print("OK: Codex headless questions=\(questions.count)")
+    let answer = try await runner.chat(
+        question: "Quel point doit encore etre clarifie ?",
+        history: [],
+        transcript: transcript,
+        executablePath: executablePath,
+        configuration: configuration
+    )
+    guard !answer.isEmpty else {
+        throw MeetingAIError.invalidOutput("Le chat n'a retourne aucune reponse.")
+    }
+    print("OK: Codex headless questions=\(questions.count), chat=ready")
 } catch {
     fputs("FAIL: \(error.localizedDescription)\n", stderr)
     exit(EXIT_FAILURE)

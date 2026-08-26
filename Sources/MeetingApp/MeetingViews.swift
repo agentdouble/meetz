@@ -9,13 +9,25 @@ struct MeetingRootView: View {
     @State private var meetingToDelete: MeetingRecord?
 
     var body: some View {
-        NavigationSplitView {
-            sidebar
-                .navigationSplitViewColumnWidth(min: 230, ideal: 260, max: 320)
-        } detail: {
-            transcriptView
+        HStack(spacing: 0) {
+            NavigationSplitView {
+                sidebar
+                    .navigationSplitViewColumnWidth(min: 230, ideal: 260, max: 320)
+            } detail: {
+                transcriptView
+            }
+
+            if aiController.isShowingPanel {
+                Divider()
+                MeetingAIPanelView()
+                    .environmentObject(controller)
+                    .environmentObject(aiController)
+                    .frame(minWidth: 340, idealWidth: 390, maxWidth: 460)
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
+            }
         }
-        .frame(minWidth: 940, minHeight: 620)
+        .frame(minWidth: 1_040, minHeight: 620)
+        .animation(.easeInOut(duration: 0.18), value: aiController.isShowingPanel)
         .task {
             await controller.load()
             await aiController.loadResults(meetingID: controller.selectedMeetingID)
@@ -27,11 +39,6 @@ struct MeetingRootView: View {
         }
         .sheet(isPresented: $aiController.isShowingSettings) {
             MeetingAISettingsView()
-                .environmentObject(aiController)
-        }
-        .sheet(isPresented: $aiController.isShowingPanel) {
-            MeetingAIPanelView()
-                .environmentObject(controller)
                 .environmentObject(aiController)
         }
         .onChange(of: controller.selectedMeetingID) {
@@ -81,8 +88,8 @@ struct MeetingRootView: View {
                 }
                 .buttonStyle(.plain)
                 .disabled(controller.selectedMeetingID == nil)
-                .help("Ouvrir les actions IA — \(aiController.shortcut.displayValue)")
-                .accessibilityLabel("Ouvrir les actions IA")
+                .help("Discuter du transcript — \(aiController.shortcut.displayValue)")
+                .accessibilityLabel("Ouvrir le chat du transcript")
 
                 Button {
                     aiController.isShowingSettings = true
@@ -263,47 +270,20 @@ struct MeetingRootView: View {
                 CompactLevel(title: "MAC", level: controller.systemLevel)
             }
 
-            if let meetingID = controller.selectedMeetingID {
-                aiHeaderAction(
-                    title: "Questions",
-                    systemImage: "questionmark.bubble",
-                    kind: .questions,
-                    meetingID: meetingID
-                )
-                aiHeaderAction(
-                    title: "Prochaines étapes",
-                    systemImage: "arrow.right.circle",
-                    kind: .nextSteps,
-                    meetingID: meetingID
-                )
+            if controller.selectedMeetingID != nil {
+                Button {
+                    aiController.openPanel()
+                } label: {
+                    Label("Discuter", systemImage: "bubble.left.and.bubble.right")
+                }
+                .buttonStyle(.borderless)
+                .help("Discuter du transcript")
             }
 
             phaseIndicator
         }
         .padding(.horizontal, 28)
         .padding(.vertical, 20)
-    }
-
-    private func aiHeaderAction(
-        title: String,
-        systemImage: String,
-        kind: MeetingAIJobKind,
-        meetingID: UUID
-    ) -> some View {
-        Button {
-            aiController.run(kind, meetingID: meetingID)
-        } label: {
-            Label(title, systemImage: systemImage)
-                .labelStyle(.iconOnly)
-                .frame(width: 22, height: 22)
-        }
-        .buttonStyle(.plain)
-        .disabled(
-            (controller.segments.isEmpty && controller.realtimeSegments.isEmpty)
-                || aiController.runningKinds.contains(kind)
-        )
-        .help(title)
-        .accessibilityLabel(title)
     }
 
     private func meetingContextBar(_ meeting: MeetingRecord) -> some View {

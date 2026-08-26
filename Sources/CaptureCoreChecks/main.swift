@@ -253,6 +253,20 @@ do {
         createdAt: Date(timeIntervalSince1970: 1_700_000_100)
     )
     try await store.saveAIResult(aiResult)
+    let chatQuestion = MeetingAIChatMessage(
+        meetingID: meeting.id,
+        role: .user,
+        content: "Quelles sont les prochaines etapes ?",
+        createdAt: Date(timeIntervalSince1970: 1_700_000_101)
+    )
+    let chatAnswer = MeetingAIChatMessage(
+        meetingID: meeting.id,
+        role: .assistant,
+        content: "Le transcript ne precise pas encore de prochaine etape.",
+        createdAt: Date(timeIntervalSince1970: 1_700_000_102)
+    )
+    try await store.saveAIChatMessage(chatQuestion)
+    try await store.saveAIChatMessage(chatAnswer)
     try await store.enqueueAIJobs(meetingID: meeting.id, kinds: [.title, .summary, .title])
 
     let automaticTitleMeeting = try await store.createMeeting()
@@ -292,6 +306,7 @@ do {
     let storedVoiceProfile = try await store.voiceProfile()
     let storedVoiceProfiles = try await store.voiceProfiles()
     let storedAIResults = try await store.aiResults(meetingID: meeting.id)
+    let storedChatMessages = try await store.aiChatMessages(meetingID: meeting.id)
     let pendingAIJobs = try await store.pendingAIJobs()
     try expect(storedMeetings.count == 2, "Les reunions doivent etre sauvegardees")
     let completedMeeting = storedMeetings.first { $0.id == meeting.id }
@@ -327,6 +342,10 @@ do {
     try expect(appliedAutomaticTitle, "Codex doit pouvoir remplacer un titre automatique")
     try expect(!refusedSecondAutomaticTitle, "Codex ne doit jamais remplacer un titre non automatique")
     try expect(storedAIResults == [aiResult], "Le resultat IA doit etre conserve avec la reunion")
+    try expect(
+        storedChatMessages == [chatQuestion, chatAnswer],
+        "La conversation IA doit etre conservee dans son ordre avec la reunion"
+    )
     try expect(pendingAIJobs.map(\.kind) == [.title, .summary], "Les jobs IA doivent etre durables et dedoublonnes")
     try await store.completeAIJob(meetingID: meeting.id, kind: .title)
     let remainingAIJobs = try await store.pendingAIJobs()

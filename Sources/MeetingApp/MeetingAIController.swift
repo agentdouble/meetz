@@ -13,8 +13,17 @@ final class MeetingAIController: ObservableObject {
     @Published private(set) var lastError: String?
     @Published private(set) var lastCompletedKind: MeetingAIJobKind?
     @Published private(set) var shortcut: AIShortcut
+    @Published private(set) var chatMessages: [MeetingAIChatMessage] = []
+    @Published private(set) var chatMeetingID: UUID?
+    @Published private(set) var isChatRunning = false
     @Published var codexExecutablePath: String {
         didSet { defaults.set(codexExecutablePath, forKey: Keys.codexPath) }
+    }
+    @Published var codexModel: String {
+        didSet { defaults.set(codexModel, forKey: Keys.codexModel) }
+    }
+    @Published var codexReasoningEffort: CodexReasoningEffort {
+        didSet { defaults.set(codexReasoningEffort.rawValue, forKey: Keys.codexReasoningEffort) }
     }
     @Published var automaticallyGenerateTitle: Bool {
         didSet { defaults.set(automaticallyGenerateTitle, forKey: Keys.automaticTitle) }
@@ -25,6 +34,8 @@ final class MeetingAIController: ObservableObject {
 
     private enum Keys {
         static let codexPath = "meeting.ai.codexPath"
+        static let codexModel = "meeting.ai.codexModel"
+        static let codexReasoningEffort = "meeting.ai.codexReasoningEffort"
         static let shortcut = "meeting.ai.shortcut"
         static let automaticTitle = "meeting.ai.automaticTitle"
         static let automaticSummary = "meeting.ai.automaticSummary"
@@ -39,6 +50,10 @@ final class MeetingAIController: ObservableObject {
         self.defaults = defaults
         codexExecutablePath = defaults.string(forKey: Keys.codexPath)
             ?? Self.detectCodexExecutable()
+        codexModel = defaults.string(forKey: Keys.codexModel) ?? "gpt-5.6-terra"
+        codexReasoningEffort = defaults.string(forKey: Keys.codexReasoningEffort)
+            .flatMap(CodexReasoningEffort.init(rawValue:))
+            ?? .medium
         automaticallyGenerateTitle = defaults.object(forKey: Keys.automaticTitle) as? Bool ?? true
         automaticallyGenerateSummary = defaults.object(forKey: Keys.automaticSummary) as? Bool ?? true
         if let data = defaults.data(forKey: Keys.shortcut),
@@ -63,10 +78,21 @@ final class MeetingAIController: ObservableObject {
 
     var isRunning: Bool { !runningKinds.isEmpty }
 
+    var configuration: CodexRunConfiguration {
+        CodexRunConfiguration(
+            model: codexModel,
+            reasoningEffort: codexReasoningEffort
+        )
+    }
+
     func openPanel() {
         NSApplication.shared.activate(ignoringOtherApps: true)
         NSApplication.shared.windows.first { $0.canBecomeKey }?.makeKeyAndOrderFront(nil)
         isShowingPanel = true
+    }
+
+    func closePanel() {
+        isShowingPanel = false
     }
 
     func updateShortcut(_ newShortcut: AIShortcut) {
@@ -94,11 +120,15 @@ final class MeetingAIController: ObservableObject {
         guard let meetingID, let service else {
             results = []
             resultsMeetingID = nil
+            chatMessages = []
+            chatMeetingID = nil
             return
         }
         do {
             results = try await service.results(meetingID: meetingID)
             resultsMeetingID = meetingID
+            chatMessages = try await service.chatMessages(meetingID: meetingID)
+            chatMeetingID = meetingID
         } catch {
             lastError = error.localizedDescription
         }
@@ -115,7 +145,8 @@ final class MeetingAIController: ObservableObject {
                 let run = try await service.run(
                     kind: kind,
                     meetingID: meetingID,
-                    executablePath: codexExecutablePath
+                    executablePath: codexExecutablePath,
+                    configuration: configuration
                 )
                 if resultsMeetingID == meetingID {
                     results.insert(run.storedResult, at: 0)
@@ -128,6 +159,45 @@ final class MeetingAIController: ObservableObject {
                 lastError = error.localizedDescription
             }
             runningKinds.remove(kind)
+        }
+    }
+
+    func sendChat(_ question: String, meetingID: UUID) {
+        let normalizedQuestion = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedQuestion.isEmpty, !isChatRunning, let service else { return }
+        isShowingPanel = true
+        isChatRunning = true
+        lastError = nil
+        let userMessage = MeetingAIChatMessage(
+            meetingID: meetingID,
+            role: .user,
+            content: normalizedQuestion
+        )
+        if chatMeetingID == meetingID {
+            chatMessages.append(userMessage)
+        }
+        let executablePath = codexExecutablePath
+        let runConfiguration = configuration
+
+        Task {
+            do {
+                let run = try await service.chat(
+                    userMessage: userMessage,
+                    meetingID: meetingID,
+                    executablePath: executablePath,
+                    configuration: runConfiguration
+                )
+                if chatMeetingID == meetingID {
+                    chatMessages.append(run.assistantMessage)
+                }
+            } catch {
+                lastError = error.localizedDescription
+                if chatMeetingID == meetingID,
+                   let storedMessages = try? await service.chatMessages(meetingID: meetingID) {
+                    chatMessages = storedMessages
+                }
+            }
+            isChatRunning = false
         }
     }
 
@@ -158,7 +228,8 @@ final class MeetingAIController: ObservableObject {
                 do {
                     let run = try await service.runPending(
                         job,
-                        executablePath: codexExecutablePath
+                        executablePath: codexExecutablePath,
+                        configuration: configuration
                     )
                     if resultsMeetingID == job.meetingID {
                         results.insert(run.storedResult, at: 0)

@@ -1,6 +1,43 @@
 import Foundation
 import MeetingDomain
 
+public enum CodexReasoningEffort: String, CaseIterable, Codable, Identifiable, Sendable {
+    case inherit
+    case low
+    case medium
+    case high
+    case xhigh
+    case max
+
+    public var id: String { rawValue }
+}
+
+public struct CodexRunConfiguration: Sendable, Equatable {
+    public let model: String
+    public let reasoningEffort: CodexReasoningEffort
+
+    public init(
+        model: String = "",
+        reasoningEffort: CodexReasoningEffort = .inherit
+    ) {
+        self.model = model.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.reasoningEffort = reasoningEffort
+    }
+
+    public static let inherit = CodexRunConfiguration()
+
+    var commandLineArguments: [String] {
+        var arguments: [String] = []
+        if !model.isEmpty {
+            arguments += ["--model", model]
+        }
+        if reasoningEffort != .inherit {
+            arguments += ["--config", "model_reasoning_effort=\"\(reasoningEffort.rawValue)\""]
+        }
+        return arguments
+    }
+}
+
 public struct MeetingAITranscriptExport: Codable, Sendable {
     public let schemaVersion: Int
     public let meeting: MeetingRecord
@@ -11,6 +48,20 @@ public struct MeetingAITranscriptExport: Codable, Sendable {
         self.meeting = meeting
         self.segments = segments
     }
+}
+
+public struct MeetingAIChatHistoryExport: Codable, Sendable {
+    public let schemaVersion: Int
+    public let messages: [MeetingAIChatMessage]
+
+    public init(messages: [MeetingAIChatMessage]) {
+        schemaVersion = 1
+        self.messages = messages
+    }
+}
+
+public struct ChatAnswerPayload: Codable, Sendable {
+    public let answer: String
 }
 
 public enum MeetingAIOutput: Sendable, Equatable {

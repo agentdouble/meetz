@@ -112,19 +112,21 @@ fermeture des flux :
 
 ## Intelligence artificielle avec Codex
 
-La roue crantee ouvre les reglages IA : chemin de l'executable Codex,
-raccourci global personnalisable et automatisations de fin de reunion. Le
-raccourci par defaut est `Option + Commande + I`.
+La roue crantee ouvre les reglages IA : modele Codex, effort de raisonnement,
+chemin de l'executable, raccourci global personnalisable et automatisations de
+fin de reunion. Le raccourci par defaut est `Option + Commande + I`.
 
 Deux traitements sont inscrits dans une file SQLite durable a la fin d'une
 reunion : proposer un titre si le titre par defaut n'a jamais ete modifie, puis
-generer un resume. Des boutons permettent aussi de demander a tout moment des
-questions utiles a poser ou des prochaines etapes.
+generer un resume. Un chat integre a droite permet ensuite de discuter librement
+avec le transcript selectionne. Ses raccourcis produisent un resume, des
+prochaines etapes, des questions a poser ou les problemes restant a resoudre.
 
 Chaque traitement transmet uniquement l'export JSON versionne du transcript a
 `codex exec`, dans un dossier temporaire et une sandbox en lecture seule. La
-sortie est contrainte par un schema JSON propre au traitement, validee, puis
-conservee localement avec la reunion. Aucun audio n'est transmis.
+sortie est contrainte par un schema JSON, validee, puis conservee localement
+avec la reunion. L'historique du chat est lui aussi stocke dans SQLite. Aucun
+audio n'est transmis.
 
 Controle reel du runner sur un transcript synthetique :
 

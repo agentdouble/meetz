@@ -7,9 +7,76 @@ public actor CodexHeadlessRunner {
     public func run(
         kind: MeetingAIJobKind,
         transcript: MeetingAITranscriptExport,
-        executablePath: String
+        executablePath: String,
+        configuration: CodexRunConfiguration = .inherit
     ) async throws -> MeetingAIOutput {
         guard !transcript.segments.isEmpty else { throw MeetingAIError.emptyTranscript }
+        let outputData = try await execute(
+            transcript: transcript,
+            executablePath: executablePath,
+            configuration: configuration,
+            prompt: Self.prompt(for: kind),
+            schema: Self.schema(for: kind)
+        )
+        do {
+            return try Self.decode(kind: kind, data: outputData)
+        } catch {
+            throw MeetingAIError.invalidOutput(error.localizedDescription)
+        }
+    }
+
+    public func chat(
+        question: String,
+        history: [MeetingAIChatMessage],
+        transcript: MeetingAITranscriptExport,
+        executablePath: String,
+        configuration: CodexRunConfiguration = .inherit
+    ) async throws -> String {
+        guard !transcript.segments.isEmpty else { throw MeetingAIError.emptyTranscript }
+        let normalizedQuestion = question.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedQuestion.isEmpty else {
+            throw MeetingAIError.invalidOutput("La question est vide.")
+        }
+
+        let boundedHistory = Array(history.suffix(24))
+        let historyData = try Self.makeEncoder().encode(
+            MeetingAIChatHistoryExport(messages: boundedHistory)
+        )
+        let outputData = try await execute(
+            transcript: transcript,
+            executablePath: executablePath,
+            configuration: configuration,
+            prompt: Self.chatPrompt,
+            schema: Self.chatSchema,
+            additionalFiles: [
+                "conversation.json": historyData,
+                "question.txt": Data(normalizedQuestion.utf8),
+            ]
+        )
+
+        do {
+            let answer = try JSONDecoder().decode(ChatAnswerPayload.self, from: outputData)
+                .answer
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !answer.isEmpty else {
+                throw MeetingAIError.invalidOutput("La reponse du chat est vide.")
+            }
+            return answer
+        } catch let error as MeetingAIError {
+            throw error
+        } catch {
+            throw MeetingAIError.invalidOutput(error.localizedDescription)
+        }
+    }
+
+    private func execute(
+        transcript: MeetingAITranscriptExport,
+        executablePath: String,
+        configuration: CodexRunConfiguration,
+        prompt: String,
+        schema: String,
+        additionalFiles: [String: Data] = [:]
+    ) async throws -> Data {
         guard FileManager.default.isExecutableFile(atPath: executablePath) else {
             throw MeetingAIError.executableUnavailable(executablePath)
         }
@@ -24,27 +91,28 @@ public actor CodexHeadlessRunner {
         let outputURL = workspace.appendingPathComponent("output.json")
         let logURL = workspace.appendingPathComponent("codex.log")
 
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try encoder.encode(transcript).write(to: inputURL, options: .atomic)
-        try Self.schema(for: kind).write(to: schemaURL, atomically: true, encoding: .utf8)
+        try Self.makeEncoder().encode(transcript).write(to: inputURL, options: .atomic)
+        try schema.write(to: schemaURL, atomically: true, encoding: .utf8)
+        for (name, data) in additionalFiles {
+            try data.write(to: workspace.appendingPathComponent(name), options: .atomic)
+        }
         FileManager.default.createFile(atPath: logURL.path, contents: nil)
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executablePath)
         process.currentDirectoryURL = workspace
-        process.arguments = [
-            "exec",
-            "--cd", workspace.path,
-            "--sandbox", "read-only",
-            "--skip-git-repo-check",
-            "--ephemeral",
-            "--color", "never",
-            "--output-schema", schemaURL.path,
-            "--output-last-message", outputURL.path,
-            "-",
-        ]
+        process.arguments = ["exec"]
+            + configuration.commandLineArguments
+            + [
+                "--cd", workspace.path,
+                "--sandbox", "read-only",
+                "--skip-git-repo-check",
+                "--ephemeral",
+                "--color", "never",
+                "--output-schema", schemaURL.path,
+                "--output-last-message", outputURL.path,
+                "-",
+            ]
 
         let inputPipe = Pipe()
         let logHandle = try FileHandle(forWritingTo: logURL)
@@ -59,8 +127,7 @@ public actor CodexHeadlessRunner {
             }
             do {
                 try process.run()
-                let promptData = Self.prompt(for: kind).data(using: .utf8) ?? Data()
-                inputPipe.fileHandleForWriting.write(promptData)
+                inputPipe.fileHandleForWriting.write(Data(prompt.utf8))
                 inputPipe.fileHandleForWriting.closeFile()
             } catch {
                 process.terminationHandler = nil
@@ -76,11 +143,14 @@ public actor CodexHeadlessRunner {
         guard let outputData = try? Data(contentsOf: outputURL), !outputData.isEmpty else {
             throw MeetingAIError.invalidOutput(Self.tail(log))
         }
-        do {
-            return try Self.decode(kind: kind, data: outputData)
-        } catch {
-            throw MeetingAIError.invalidOutput(error.localizedDescription)
-        }
+        return outputData
+    }
+
+    private static func makeEncoder() -> JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return encoder
     }
 
     private static func decode(kind: MeetingAIJobKind, data: Data) throws -> MeetingAIOutput {
@@ -113,6 +183,15 @@ public actor CodexHeadlessRunner {
         Mission : \(instruction(for: kind))
         """
     }
+
+    private static let chatPrompt = """
+        Tu es l'assistant d'une transcription de reunion. Lis transcript.json, conversation.json
+        et question.txt dans le dossier courant. Reponds a la question en t'appuyant uniquement
+        sur le transcript, son contexte et l'historique de conversation. N'invente aucun fait,
+        responsable, engagement ou echeance. Si l'information manque, dis-le clairement.
+        Reponds en francais sauf demande explicite contraire. Utilise un Markdown simple et concis.
+        Retourne uniquement l'objet JSON impose par le schema de sortie.
+        """
 
     private static func instruction(for kind: MeetingAIJobKind) -> String {
         switch kind {
@@ -157,6 +236,11 @@ public actor CodexHeadlessRunner {
             )
         }
     }
+
+    private static let chatSchema = objectSchema(
+        properties: "\"answer\": {\"type\": \"string\", \"minLength\": 1}",
+        required: "\"answer\""
+    )
 
     private static func objectSchema(properties: String, required: String) -> String {
         """

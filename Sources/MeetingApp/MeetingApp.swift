@@ -13,7 +13,7 @@ struct MeetingApplication: App {
                 .environmentObject(aiController)
         }
         .windowStyle(.hiddenTitleBar)
-        .defaultSize(width: 1_080, height: 720)
+        .defaultSize(width: 1_380, height: 760)
 
         MenuBarExtra("Meeting", systemImage: controller.isRecording ? "waveform" : "waveform.slash") {
             Button(controller.isRecording ? "Arreter la transcription" : "Nouvelle reunion") {
@@ -31,7 +31,7 @@ struct MeetingApplication: App {
                 controller.openMainWindow()
             }
 
-            Button("Actions IA") {
+            Button("Discuter du transcript") {
                 aiController.openPanel()
             }
             .disabled(controller.selectedMeetingID == nil)

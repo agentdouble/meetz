@@ -313,6 +313,15 @@ Obsidian reste un ensemble de notes Markdown structurees. Une vue Obsidian Bases
 - Resultats JSON conserves localement et rattaches a la reunion ; aucun audio n'est transmis.
 - Reglages SwiftUI pour le chemin Codex, les automatismes et un raccourci global personnalisable.
 
+### Chat de transcript implemente le 2026-08-25
+
+- Le panneau IA est integre a droite de la fenetre principale et suit la reunion selectionnee.
+- Une question libre et les raccourcis resume, prochaines etapes, questions a poser et problemes a resoudre utilisent le meme export de transcript.
+- Les messages utilisateur et assistant sont conserves localement dans SQLite et supprimes en cascade avec leur reunion.
+- Chaque appel relit le transcript exploitable courant et un historique borne de conversation ; aucune session Codex durable nest requise.
+- Les reglages permettent de choisir le modele Codex et leffort de raisonnement. Ces options sappliquent aussi au titre et au resume automatiques.
+- `codex exec` reste ephemere, en sandbox lecture seule, avec une sortie JSON validee ; aucun fichier audio nest transmis.
+
 ## 14. Hors scope MVP
 
 - Resume, decisions et taches automatiques.

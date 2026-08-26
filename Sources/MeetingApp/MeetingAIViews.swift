@@ -6,6 +6,13 @@ struct MeetingAISettingsView: View {
     @EnvironmentObject private var aiController: MeetingAIController
     @Environment(\.dismiss) private var dismiss
 
+    private let modelOptions = [
+        ("", "Configuration Codex"),
+        ("gpt-5.6-luna", "GPT-5.6 Luna — rapide"),
+        ("gpt-5.6-terra", "GPT-5.6 Terra — équilibré"),
+        ("gpt-5.6-sol", "GPT-5.6 Sol — qualité"),
+    ]
+
     var body: some View {
         VStack(spacing: 0) {
             HStack {
@@ -32,7 +39,7 @@ struct MeetingAISettingsView: View {
                         }
                         .frame(width: 180, height: 28)
                     }
-                    Text("Ce raccourci ouvre les actions IA depuis n’importe quelle application.")
+                    Text("Ce raccourci ouvre le chat du transcript depuis n’importe quelle application.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -43,6 +50,18 @@ struct MeetingAISettingsView: View {
                 }
 
                 Section("Codex headless") {
+                    Picker("Modèle", selection: $aiController.codexModel) {
+                        ForEach(modelOptions, id: \.0) { value, label in
+                            Text(label).tag(value)
+                        }
+                    }
+
+                    Picker("Effort", selection: $aiController.codexReasoningEffort) {
+                        ForEach(CodexReasoningEffort.allCases) { effort in
+                            Text(effort.displayName).tag(effort)
+                        }
+                    }
+
                     TextField("Chemin vers codex", text: $aiController.codexExecutablePath)
                         .textFieldStyle(.roundedBorder)
                     HStack {
@@ -54,7 +73,7 @@ struct MeetingAISettingsView: View {
                         Spacer()
                         Button("Détecter", action: aiController.detectCodexAgain)
                     }
-                    Text("Le transcript sélectionné est transmis à Codex pour ces traitements. Aucun fichier audio n’est envoyé.")
+                    Text("Le modèle et l’effort s’appliquent au chat et aux traitements automatiques. Seul le texte du transcript est transmis à Codex, jamais l’audio.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -62,164 +81,270 @@ struct MeetingAISettingsView: View {
             .formStyle(.grouped)
             .padding(.horizontal, 8)
         }
-        .frame(width: 620, height: 540)
+        .frame(width: 620, height: 620)
     }
 }
 
 struct MeetingAIPanelView: View {
     @EnvironmentObject private var aiController: MeetingAIController
     @EnvironmentObject private var meetingController: MeetingController
-    @Environment(\.dismiss) private var dismiss
-    @State private var selectedKind: MeetingAIJobKind = .summary
+    @State private var draft = ""
 
     private var meetingID: UUID? { meetingController.selectedMeetingID }
+    private var hasTranscript: Bool {
+        !meetingController.segments.isEmpty || !meetingController.realtimeSegments.isEmpty
+    }
+
+    private let quickActions = [
+        ChatQuickAction(
+            title: "Résumé",
+            icon: "text.alignleft",
+            prompt: "Résume cette réunion en faisant ressortir son objectif, les points importants et les conclusions."
+        ),
+        ChatQuickAction(
+            title: "Prochaines étapes",
+            icon: "arrow.right.circle",
+            prompt: "Liste les prochaines étapes concrètes. N’attribue un responsable ou une échéance que si le transcript les mentionne."
+        ),
+        ChatQuickAction(
+            title: "Questions à poser",
+            icon: "questionmark.bubble",
+            prompt: "Propose les questions utiles à poser pour clarifier les zones floues, les décisions et les risques."
+        ),
+        ChatQuickAction(
+            title: "Problèmes à résoudre",
+            icon: "exclamationmark.bubble",
+            prompt: "Identifie les problèmes, blocages, risques ou désaccords qui restent à résoudre d’après le transcript."
+        ),
+    ]
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("CODEX HEADLESS")
-                        .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                        .tracking(1.4)
-                    Text(meetingController.selectedMeeting?.title ?? "Actions IA")
-                        .font(.title2.weight(.semibold))
-                        .lineLimit(1)
-                }
-                Spacer()
-                Button("Fermer") { dismiss() }
-                    .keyboardShortcut(.cancelAction)
-            }
-            .padding(22)
-
+            header
             Divider()
-
-            HStack(spacing: 8) {
-                actionTab(.summary, title: "Résumé", icon: "text.alignleft")
-                actionTab(.questions, title: "Questions", icon: "questionmark.bubble")
-                actionTab(.nextSteps, title: "Prochaines étapes", icon: "arrow.right.circle")
-                Spacer()
-            }
-            .padding(16)
-
+            conversation
             Divider()
-
-            Group {
-                if let result = aiController.latestResult(for: selectedKind) {
-                    ScrollView {
-                        Text(aiController.displayText(for: result))
-                            .font(.body)
-                            .lineSpacing(4)
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(24)
-                    }
-                } else if aiController.runningKinds.contains(selectedKind) {
-                    VStack(spacing: 12) {
-                        ProgressView()
-                        Text("Codex analyse le transcript…")
-                            .foregroundStyle(.secondary)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .accessibilityElement(children: .combine)
-                } else {
-                    VStack(spacing: 12) {
-                        Image(systemName: icon(for: selectedKind))
-                            .font(.system(size: 34, weight: .light))
-                        Text(emptyMessage(for: selectedKind))
-                            .font(.headline)
-                        Text("Le résultat sera conservé localement avec cette réunion.")
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                }
-            }
-            .overlay(alignment: .bottom) {
-                if let error = aiController.lastError {
-                    Text(error)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .padding(10)
-                        .frame(maxWidth: .infinity)
-                        .background(.thinMaterial)
-                        .accessibilityLabel("Erreur IA : \(error)")
-                }
-            }
-
-            Divider()
-
-            HStack {
-                let segmentCount = meetingController.realtimeSegments.isEmpty
-                    ? meetingController.segments.count
-                    : meetingController.realtimeSegments.count
-                Text("\(segmentCount) segment\(segmentCount > 1 ? "s" : "") exploitable\(segmentCount > 1 ? "s" : "")")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button(aiController.latestResult(for: selectedKind) == nil ? "Lancer" : "Regénérer") {
-                    runSelectedAction()
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(
-                    meetingID == nil
-                    || (meetingController.segments.isEmpty
-                        && meetingController.realtimeSegments.isEmpty)
-                    || aiController.runningKinds.contains(selectedKind)
-                )
-            }
-            .padding(16)
+            quickActionGrid
+            composer
         }
-        .frame(width: 720, height: 560)
+        .background(Color(nsColor: .windowBackgroundColor))
         .task { await aiController.loadResults(meetingID: meetingID) }
         .onChange(of: meetingID) {
+            draft = ""
             Task { await aiController.loadResults(meetingID: meetingID) }
         }
-        .onChange(of: aiController.lastCompletedKind) {
-            if let kind = aiController.lastCompletedKind, kind != .title {
-                selectedKind = kind
+    }
+
+    private var header: some View {
+        HStack(alignment: .top, spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("ASSISTANT")
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .tracking(1.4)
+                Text("Discuter du transcript")
+                    .font(.headline)
+                Text(configurationLabel)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+            Button(action: aiController.closePanel) {
+                Image(systemName: "xmark")
+                    .frame(width: 20, height: 20)
+            }
+            .buttonStyle(.plain)
+            .help("Fermer le chat")
+            .accessibilityLabel("Fermer le chat")
+        }
+        .padding(18)
+    }
+
+    private var configurationLabel: String {
+        let model = aiController.codexModel.isEmpty ? "Modèle Codex" : aiController.codexModel
+        return "\(model) · \(aiController.codexReasoningEffort.displayName.lowercased())"
+    }
+
+    private var conversation: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 14) {
+                    if aiController.chatMessages.isEmpty && !aiController.isChatRunning {
+                        chatEmptyState
+                    } else {
+                        ForEach(aiController.chatMessages) { message in
+                            ChatMessageBubble(message: message)
+                                .id(message.id)
+                        }
+                    }
+
+                    if aiController.isChatRunning {
+                        HStack(spacing: 9) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Codex analyse le transcript…")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(12)
+                        .background(Color.primary.opacity(0.045))
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                        .id("chat-progress")
+                        .accessibilityElement(children: .combine)
+                    }
+
+                    if let error = aiController.lastError {
+                        Label(error, systemImage: "exclamationmark.triangle")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .padding(10)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(Color.primary.opacity(0.035))
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                    }
+                }
+                .padding(16)
+            }
+            .onChange(of: aiController.chatMessages.map(\.id)) {
+                if let last = aiController.chatMessages.last {
+                    withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                }
+            }
+            .onChange(of: aiController.isChatRunning) {
+                if aiController.isChatRunning {
+                    withAnimation { proxy.scrollTo("chat-progress", anchor: .bottom) }
+                }
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private func actionTab(
-        _ kind: MeetingAIJobKind,
-        title: String,
-        icon: String
-    ) -> some View {
-        Button {
-            selectedKind = kind
-        } label: {
-            Label(title, systemImage: icon)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 7)
-                .background(selectedKind == kind ? Color.primary : Color.clear)
-                .foregroundStyle(selectedKind == kind ? Color(nsColor: .windowBackgroundColor) : Color.primary)
-                .clipShape(RoundedRectangle(cornerRadius: 7))
+    private var chatEmptyState: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Image(systemName: "bubble.left.and.text.bubble.right")
+                .font(.system(size: 30, weight: .light))
+            Text(meetingID == nil ? "Sélectionne une réunion" : "Que veux-tu savoir ?")
+                .font(.headline)
+            Text(
+                meetingID == nil
+                    ? "Le chat utilisera le transcript sélectionné."
+                    : "Pose une question libre ou lance l’une des analyses ci-dessous."
+            )
+            .font(.callout)
+            .foregroundStyle(.secondary)
         }
-        .buttonStyle(.plain)
-        .accessibilityAddTraits(selectedKind == kind ? .isSelected : [])
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 18)
     }
 
-    private func runSelectedAction() {
-        guard let meetingID else { return }
-        aiController.run(selectedKind, meetingID: meetingID)
-    }
-
-    private func icon(for kind: MeetingAIJobKind) -> String {
-        switch kind {
-        case .summary: "text.alignleft"
-        case .questions: "questionmark.bubble"
-        case .nextSteps: "arrow.right.circle"
-        case .title: "character.cursor.ibeam"
+    private var quickActionGrid: some View {
+        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+            ForEach(quickActions) { action in
+                Button {
+                    send(action.prompt)
+                } label: {
+                    Label(action.title, systemImage: action.icon)
+                        .font(.caption.weight(.medium))
+                        .lineLimit(1)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 9)
+                        .background(Color.primary.opacity(0.045))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+                .buttonStyle(.plain)
+                .disabled(!canSend)
+            }
         }
+        .padding(.horizontal, 14)
+        .padding(.top, 12)
     }
 
-    private func emptyMessage(for kind: MeetingAIJobKind) -> String {
-        switch kind {
-        case .summary: "Aucun résumé généré"
-        case .questions: "Aucune question proposée"
-        case .nextSteps: "Aucune prochaine étape proposée"
-        case .title: "Aucun titre proposé"
+    private var composer: some View {
+        HStack(alignment: .bottom, spacing: 8) {
+            TextField("Question sur cette réunion…", text: $draft, axis: .vertical)
+                .textFieldStyle(.plain)
+                .lineLimit(1...5)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
+                .background(Color.primary.opacity(0.045))
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .onSubmit { sendDraft() }
+                .accessibilityLabel("Question sur le transcript")
+
+            Button(action: sendDraft) {
+                Image(systemName: "arrow.up")
+                    .font(.system(size: 13, weight: .bold))
+                    .frame(width: 34, height: 34)
+                    .foregroundStyle(Color(nsColor: .windowBackgroundColor))
+                    .background(Color.primary)
+                    .clipShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!canSend || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            .help("Envoyer")
+            .accessibilityLabel("Envoyer la question")
+        }
+        .padding(14)
+    }
+
+    private var canSend: Bool {
+        meetingID != nil && hasTranscript && !aiController.isChatRunning && aiController.isCodexAvailable
+    }
+
+    private func sendDraft() {
+        let question = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !question.isEmpty else { return }
+        draft = ""
+        send(question)
+    }
+
+    private func send(_ question: String) {
+        guard let meetingID, canSend else { return }
+        aiController.sendChat(question, meetingID: meetingID)
+    }
+}
+
+private struct ChatQuickAction: Identifiable {
+    let title: String
+    let icon: String
+    let prompt: String
+
+    var id: String { title }
+}
+
+private struct ChatMessageBubble: View {
+    let message: MeetingAIChatMessage
+
+    var body: some View {
+        HStack {
+            if message.role == .user { Spacer(minLength: 42) }
+            Text(message.content)
+                .font(.callout)
+                .lineSpacing(3)
+                .textSelection(.enabled)
+                .foregroundStyle(message.role == .user ? Color(nsColor: .windowBackgroundColor) : Color.primary)
+                .padding(.horizontal, 13)
+                .padding(.vertical, 11)
+                .background(message.role == .user ? Color.primary : Color.primary.opacity(0.05))
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+            if message.role == .assistant { Spacer(minLength: 28) }
+        }
+        .frame(maxWidth: .infinity)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(message.role == .user ? "Vous : \(message.content)" : "Assistant : \(message.content)")
+    }
+}
+
+private extension CodexReasoningEffort {
+    var displayName: String {
+        switch self {
+        case .inherit: "Effort Codex"
+        case .low: "Faible"
+        case .medium: "Moyen"
+        case .high: "Élevé"
+        case .xhigh: "Très élevé"
+        case .max: "Maximum"
         }
     }
 }

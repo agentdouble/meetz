@@ -91,6 +91,33 @@ public struct PendingMeetingAIJob: Codable, Sendable, Equatable {
     }
 }
 
+public enum MeetingAIChatRole: String, Codable, Sendable {
+    case user
+    case assistant
+}
+
+public struct MeetingAIChatMessage: Identifiable, Codable, Sendable, Equatable {
+    public let id: UUID
+    public let meetingID: UUID
+    public let role: MeetingAIChatRole
+    public let content: String
+    public let createdAt: Date
+
+    public init(
+        id: UUID = UUID(),
+        meetingID: UUID,
+        role: MeetingAIChatRole,
+        content: String,
+        createdAt: Date = Date()
+    ) {
+        self.id = id
+        self.meetingID = meetingID
+        self.role = role
+        self.content = content
+        self.createdAt = createdAt
+    }
+}
+
 public enum TranscriptInputKind: String, Codable, Sendable {
     case system
     case microphone

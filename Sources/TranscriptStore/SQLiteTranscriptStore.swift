@@ -202,6 +202,49 @@ public actor SQLiteTranscriptStore {
         }
     }
 
+    public func saveAIChatMessage(_ message: MeetingAIChatMessage) throws {
+        let normalizedContent = message.content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedContent.isEmpty else { throw TranscriptStoreError.invalidRow }
+        try execute(
+            """
+            INSERT INTO meeting_ai_chat_messages (
+                id, meeting_id, role, content, created_at
+            ) VALUES (?, ?, ?, ?, ?);
+            """,
+            bindings: [
+                .text(message.id.uuidString),
+                .text(message.meetingID.uuidString),
+                .text(message.role.rawValue),
+                .text(normalizedContent),
+                .double(message.createdAt.timeIntervalSince1970),
+            ]
+        )
+    }
+
+    public func aiChatMessages(meetingID: UUID) throws -> [MeetingAIChatMessage] {
+        try query(
+            """
+            SELECT id, meeting_id, role, content, created_at
+            FROM meeting_ai_chat_messages
+            WHERE meeting_id = ?
+            ORDER BY created_at ASC, rowid ASC;
+            """,
+            bindings: [.text(meetingID.uuidString)]
+        ) { statement in
+            guard let id = UUID(uuidString: Self.columnText(statement, index: 0)),
+                  let resolvedMeetingID = UUID(uuidString: Self.columnText(statement, index: 1)),
+                  let role = MeetingAIChatRole(rawValue: Self.columnText(statement, index: 2))
+            else { throw TranscriptStoreError.invalidRow }
+            return MeetingAIChatMessage(
+                id: id,
+                meetingID: resolvedMeetingID,
+                role: role,
+                content: Self.columnText(statement, index: 3),
+                createdAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 4))
+            )
+        }
+    }
+
     public func enqueueAIJobs(meetingID: UUID, kinds: [MeetingAIJobKind]) throws {
         try execute("BEGIN IMMEDIATE TRANSACTION;")
         do {
@@ -712,6 +755,18 @@ public actor SQLiteTranscriptStore {
 
             CREATE INDEX IF NOT EXISTS meeting_ai_results_meeting_kind_date
             ON meeting_ai_results(meeting_id, kind, created_at DESC);
+
+            CREATE TABLE IF NOT EXISTS meeting_ai_chat_messages (
+                id TEXT PRIMARY KEY NOT NULL,
+                meeting_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                FOREIGN KEY (meeting_id) REFERENCES meetings(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS meeting_ai_chat_messages_meeting_date
+            ON meeting_ai_chat_messages(meeting_id, created_at ASC);
 
             CREATE TABLE IF NOT EXISTS pending_meeting_ai_jobs (
                 meeting_id TEXT NOT NULL,
