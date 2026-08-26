@@ -68,15 +68,18 @@ public struct RealtimeTranscriptPreview: Sendable, Equatable {
     public let input: AudioInputKind
     public let text: String
     public let processedAudioDuration: TimeInterval
+    public let detectedLanguage: String?
 
     public init(
         input: AudioInputKind,
         text: String,
-        processedAudioDuration: TimeInterval = 0
+        processedAudioDuration: TimeInterval = 0,
+        detectedLanguage: String? = nil
     ) {
         self.input = input
         self.text = text
         self.processedAudioDuration = processedAudioDuration
+        self.detectedLanguage = detectedLanguage
     }
 }
 

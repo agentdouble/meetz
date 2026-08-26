@@ -4,9 +4,27 @@ import Darwin
 import Foundation
 import MeetingDomain
 import TranscriptStore
+import TranscriptionCore
 
 private struct CheckFailure: Error {
     let message: String
+}
+
+private final class LockedFanoutRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var inputsBySink: [Int: [AudioInputKind]] = [:]
+
+    func record(sink: Int, input: AudioInputKind) {
+        lock.lock()
+        inputsBySink[sink, default: []].append(input)
+        lock.unlock()
+    }
+
+    func inputs(for sink: Int) -> [AudioInputKind] {
+        lock.lock()
+        defer { lock.unlock() }
+        return inputsBySink[sink, default: []]
+    }
 }
 
 private func expect(
@@ -49,17 +67,188 @@ do {
         "Le vumetre doit borner les niveaux superieurs a un"
     )
 
+    var resumedSegmenter = RealtimeTranscriptSegmenter(
+        meetingID: UUID(),
+        input: .system,
+        timeOffset: 63.5
+    )
+    let resumedRealtimeSegment = resumedSegmenter.ingest(
+        cumulativeText: "La reunion reprend maintenant.",
+        processedAudioDuration: 2.24
+    )
+    try expect(
+        resumedRealtimeSegment?.startTime == 63.5
+            && abs((resumedRealtimeSegment?.endTime ?? 0) - 65.74) < 0.000_001,
+        "Le direct repris doit continuer les horodatages existants"
+    )
+
+    let presentationNow = Date(timeIntervalSince1970: 100)
+    let listeningPresentation = LiveTranscriptPresentation(
+        segments: [],
+        microphoneDraft: "",
+        systemDraft: "",
+        audioActivityStartedAt: nil,
+        lastTextAt: nil,
+        now: presentationNow
+    )
+    try expect(
+        listeningPresentation.activity == .listening
+            && listeningPresentation.text.isEmpty,
+        "Le direct sans son doit afficher un etat d'ecoute explicite"
+    )
+    let processingPresentation = LiveTranscriptPresentation(
+        segments: [],
+        microphoneDraft: "",
+        systemDraft: "",
+        audioActivityStartedAt: presentationNow.addingTimeInterval(-5),
+        lastTextAt: nil,
+        now: presentationNow
+    )
+    try expect(
+        processingPresentation.activity == .transcribing,
+        "Le direct doit confirmer que le son detecte est en cours de transcription"
+    )
+    let delayedPresentation = LiveTranscriptPresentation(
+        segments: [],
+        microphoneDraft: "",
+        systemDraft: "",
+        audioActivityStartedAt: presentationNow.addingTimeInterval(-20),
+        lastTextAt: nil,
+        now: presentationNow
+    )
+    try expect(
+        delayedPresentation.activity == .delayed,
+        "Le direct muet depuis douze secondes doit signaler son retard sans paraitre bloque"
+    )
+    let draftPresentation = LiveTranscriptPresentation(
+        segments: [],
+        microphoneDraft: "Brouillon microphone",
+        systemDraft: "Brouillon systeme",
+        audioActivityStartedAt: presentationNow.addingTimeInterval(-20),
+        lastTextAt: presentationNow,
+        now: presentationNow
+    )
+    try expect(
+        draftPresentation.activity == .live
+            && draftPresentation.text == "Brouillon microphone\n\nBrouillon systeme",
+        "Les brouillons moteur doivent rester un secours visible avant la persistence"
+    )
+    let laggingTextPresentation = LiveTranscriptPresentation(
+        segments: [],
+        microphoneDraft: "Texte deja visible",
+        systemDraft: "",
+        audioActivityStartedAt: presentationNow.addingTimeInterval(-20),
+        lastTextAt: presentationNow,
+        processingLag: 13,
+        now: presentationNow
+    )
+    try expect(
+        laggingTextPresentation.activity == .delayed
+            && laggingTextPresentation.processingLag == 13,
+        "Un texte ancien ne doit pas masquer un retard reel du moteur direct"
+    )
+
+    var realtimeBatcher = RealtimeAudioChunkBatcher()
+    var realtimeBatches: [AudioChunk] = []
+    for index in 0..<10 {
+        realtimeBatches += realtimeBatcher.append(
+            AudioChunk(
+                input: .microphone,
+                samples: Array(repeating: Float(index), count: 160),
+                sampleRate: 16_000,
+                startTime: Double(index) * 0.01
+            )
+        )
+    }
+    try expect(
+        realtimeBatches.count == 1
+            && realtimeBatches[0].samples.count == 1_600
+            && realtimeBatches[0].startTime == 0,
+        "Les micro-buffers doivent former un paquet ASR continu de cent millisecondes"
+    )
+    _ = realtimeBatcher.append(
+        AudioChunk(
+            input: .microphone,
+            samples: Array(repeating: 1, count: 320),
+            sampleRate: 16_000,
+            startTime: 0.1
+        )
+    )
+    let realtimeRemainder = realtimeBatcher.finish()
+    try expect(
+        realtimeRemainder?.samples.count == 320
+            && abs((realtimeRemainder?.startTime ?? 0) - 0.1) < 0.000_001,
+        "La fin de reunion doit transmettre le dernier paquet ASR incomplet"
+    )
+    var discontinuousBatcher = RealtimeAudioChunkBatcher()
+    _ = discontinuousBatcher.append(
+        AudioChunk(
+            input: .system,
+            samples: Array(repeating: 0.25, count: 1_280),
+            sampleRate: 16_000,
+            startTime: 0
+        )
+    )
+    let discontinuousBatches = discontinuousBatcher.append(
+        AudioChunk(
+            input: .system,
+            samples: Array(repeating: 0.5, count: 1_600),
+            sampleRate: 16_000,
+            startTime: 1
+        )
+    )
+    try expect(
+        discontinuousBatches.count == 2
+            && discontinuousBatches[0].samples.count == 1_280
+            && discontinuousBatches[0].startTime == 0
+            && discontinuousBatches[1].samples.count == 1_600
+            && discontinuousBatches[1].startTime == 1,
+        "Une file directe bornee ne doit pas recoller artificiellement deux intervalles discontinus"
+    )
+
+    let fanoutRecorder = LockedFanoutRecorder()
+    let fanout = AudioChunkFanout(
+        sinks: [
+            { fanoutRecorder.record(sink: 0, input: $0.input) },
+            { fanoutRecorder.record(sink: 1, input: $0.input) },
+        ]
+    )
+    fanout.yield(
+        AudioChunk(
+            input: .system,
+            samples: [0.25],
+            sampleRate: 16_000,
+            startTime: 0
+        )
+    )
+    try expect(
+        fanoutRecorder.inputs(for: 0) == [.system]
+            && fanoutRecorder.inputs(for: 1) == [.system],
+        "Le journal et le direct doivent recevoir independamment chaque paquet capture"
+    )
+    let dropCounter = AudioChunkDropCounter()
+    DispatchQueue.concurrentPerform(iterations: 1_000) { index in
+        dropCounter.record(input: index.isMultiple(of: 2) ? .microphone : .system)
+    }
+    try expect(
+        dropCounter.count(for: .microphone) == 500
+            && dropCounter.count(for: .system) == 500,
+        "Le compteur de saturation direct doit rester exact depuis les files de capture concurrentes"
+    )
+
     let journalRoot = FileManager.default.temporaryDirectory
         .appendingPathComponent("meeting-audio-journal-check-\(UUID().uuidString)", isDirectory: true)
     defer { try? FileManager.default.removeItem(at: journalRoot) }
+    let journalConfiguration = DurableAudioJournal.Configuration(
+        minimumBlockDuration: 0.5,
+        maximumBlockDuration: 1,
+        quietRootMeanSquare: 0.001,
+        synchronizationInterval: 0.1
+    )
     let journal = try DurableAudioJournal(
         rootURL: journalRoot,
-        configuration: .init(
-            minimumBlockDuration: 0.5,
-            maximumBlockDuration: 1,
-            quietRootMeanSquare: 0.001,
-            synchronizationInterval: 0.1
-        )
+        configuration: journalConfiguration,
+        sessionIdentifier: "sessionA"
     )
     let journalMeetingID = UUID()
     let journalSamples = (0..<4_000).map { index in
@@ -95,6 +284,28 @@ do {
         !FileManager.default.fileExists(atPath: recordedBlock.fileURL.path),
         "Un bloc acquitte doit etre supprime"
     )
+    let resumedJournal = try DurableAudioJournal(
+        rootURL: journalRoot,
+        configuration: journalConfiguration,
+        sessionIdentifier: "sessionB"
+    )
+    var resumedBlocks: [RecordedAudioBlock] = []
+    for index in 0..<4 {
+        resumedBlocks += try await resumedJournal.append(
+            AudioChunk(
+                input: .microphone,
+                samples: journalSamples,
+                sampleRate: 16_000,
+                startTime: Double(index) * 0.25
+            ),
+            meetingID: journalMeetingID
+        )
+    }
+    try expect(
+        resumedBlocks.count == 1 && resumedBlocks[0].id != recordedBlock.id,
+        "Une reprise doit creer un identifiant de bloc distinct apres relance"
+    )
+    try await resumedJournal.acknowledge(resumedBlocks[0])
 
     let deferredQueue = DeferredAudioBlockQueue()
     let laterBlock = RecordedAudioBlock(
@@ -161,6 +372,18 @@ do {
         audioBlockID: "realtime:microphone:0",
         source: .realtime
     )
+    let persistedPresentation = LiveTranscriptPresentation(
+        segments: [realtimeUpdated],
+        microphoneDraft: "Brouillon plus ancien",
+        systemDraft: "",
+        audioActivityStartedAt: Date(),
+        lastTextAt: Date(),
+        now: Date()
+    )
+    try expect(
+        persistedPresentation.text == realtimeUpdated.text,
+        "Le segment direct persiste doit etre la source d'affichage prioritaire"
+    )
     try await store.upsertRealtimeSegment(realtimeFirst)
     try await store.upsertRealtimeSegment(realtimeUpdated)
     let storedRealtime = try await store.segments(meetingID: realtimeMeeting.id)
@@ -187,6 +410,43 @@ do {
         preferredDuringConsolidation.count == 1
             && preferredDuringConsolidation[0].source == .realtime,
         "Le direct doit rester la seule source exploitable pendant la consolidation"
+    )
+    let historicalCanonical = TranscriptSegment(
+        meetingID: realtimeMeeting.id,
+        speakerID: "historical",
+        speakerName: "Voix 1",
+        startTime: 0,
+        endTime: 40,
+        text: "Premiere partie de la reunion.",
+        confidence: 0.9,
+        source: .canonical
+    )
+    let resumedRealtime = TranscriptSegment(
+        meetingID: realtimeMeeting.id,
+        speakerID: "realtime-system",
+        speakerName: "Participant",
+        startTime: 40,
+        endTime: 44,
+        text: "Suite en direct.",
+        confidence: 0,
+        source: .realtime
+    )
+    let consolidatingResume = TranscriptSegment(
+        meetingID: realtimeMeeting.id,
+        speakerID: "current",
+        speakerName: "Voix 2",
+        startTime: 40,
+        endTime: 43,
+        text: "Suite canonique encore en consolidation.",
+        confidence: 0.9,
+        source: .canonical
+    )
+    let preferredDuringResume = ExploitableTranscriptSelection.preferredSegments(
+        from: [historicalCanonical, consolidatingResume, resumedRealtime]
+    )
+    try expect(
+        preferredDuringResume.map(\.id) == [historicalCanonical.id, resumedRealtime.id],
+        "Une reprise doit conserver l'historique sans doubler la consolidation courante"
     )
     try await store.deleteRealtimeSegments(meetingID: realtimeMeeting.id)
     let realtimeAfterDeletion = try await store.segments(meetingID: realtimeMeeting.id)
@@ -243,6 +503,14 @@ do {
         speakerID: segment.speakerID,
         displayName: "Jeremy"
     )
+    try await store.finishMeeting(id: meeting.id)
+    let resumedMeeting = try await store.resumeMeeting(id: meeting.id)
+    var refusedResumeWhileRecording = false
+    do {
+        _ = try await store.resumeMeeting(id: meeting.id)
+    } catch TranscriptStoreError.meetingCannotResume {
+        refusedResumeWhileRecording = true
+    }
     try await store.finishMeeting(id: meeting.id)
 
     let aiResult = MeetingAIResult(
@@ -312,6 +580,14 @@ do {
     let completedMeeting = storedMeetings.first { $0.id == meeting.id }
     let recoveredMeeting = storedMeetings.first { $0.id == interruptedMeeting.id }
     try expect(completedMeeting?.state == .completed, "La reunion doit etre finalisee")
+    try expect(
+        resumedMeeting.state == .recording && resumedMeeting.endedAt == nil,
+        "Une reunion terminee doit pouvoir repasser atomiquement en enregistrement"
+    )
+    try expect(
+        refusedResumeWhileRecording,
+        "Une reunion deja en cours ne doit pas pouvoir etre reprise une seconde fois"
+    )
     try expect(completedMeeting?.title == "Controle renomme", "La reunion doit pouvoir etre renommee")
     try expect(completedMeeting?.titleOrigin == .user, "Un titre saisi doit etre marque comme utilisateur")
     try expect(

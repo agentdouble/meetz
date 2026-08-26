@@ -44,6 +44,7 @@ public actor DurableAudioJournal {
             sequence: Int,
             startTime: TimeInterval,
             sampleRate: Int,
+            sessionIdentifier: String,
             directory: URL
         ) throws {
             self.meetingID = meetingID
@@ -54,10 +55,11 @@ public actor DurableAudioJournal {
 
             let startMilliseconds = Int64((startTime * 1_000).rounded())
             let baseName = String(
-                format: "%06d_%@_%012lld.wav",
+                format: "%06d_%@_%012lld_%@.wav",
                 sequence,
                 input.rawValue,
-                startMilliseconds
+                startMilliseconds,
+                sessionIdentifier
             )
             finalURL = directory.appendingPathComponent(baseName)
             partialURL = directory.appendingPathComponent(baseName + ".part")
@@ -151,15 +153,21 @@ public actor DurableAudioJournal {
 
     private let rootURL: URL
     private let configuration: Configuration
+    private let sessionIdentifier: String
     private var writers: [WriterKey: WAVWriter] = [:]
     private var nextSequenceByKey: [WriterKey: Int] = [:]
 
     public init(
         rootURL: URL? = nil,
-        configuration: Configuration = Configuration()
+        configuration: Configuration = Configuration(),
+        sessionIdentifier: String = String(UUID().uuidString.prefix(8))
     ) throws {
         self.rootURL = try rootURL ?? Self.defaultRootURL()
         self.configuration = configuration
+        let normalizedSessionIdentifier = sessionIdentifier.filter { $0.isLetter || $0.isNumber }
+        self.sessionIdentifier = normalizedSessionIdentifier.isEmpty
+            ? String(UUID().uuidString.prefix(8))
+            : normalizedSessionIdentifier
         try FileManager.default.createDirectory(
             at: self.rootURL,
             withIntermediateDirectories: true
@@ -282,6 +290,7 @@ public actor DurableAudioJournal {
             sequence: sequence,
             startTime: chunk.startTime,
             sampleRate: chunk.sampleRate,
+            sessionIdentifier: sessionIdentifier,
             directory: directory
         )
         writers[key] = writer
@@ -320,7 +329,7 @@ public actor DurableAudioJournal {
 
     private static func block(from fileURL: URL, meetingID: UUID) throws -> RecordedAudioBlock? {
         let components = fileURL.deletingPathExtension().lastPathComponent.split(separator: "_")
-        guard components.count == 3,
+        guard (components.count == 3 || components.count == 4),
               let sequence = Int(components[0]),
               let input = AudioInputKind(rawValue: String(components[1])),
               let startMilliseconds = Int64(components[2])

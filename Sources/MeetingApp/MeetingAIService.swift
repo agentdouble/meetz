@@ -108,8 +108,32 @@ actor MeetingAIService {
         return ChatRunResult(userMessage: userMessage, assistantMessage: assistantMessage)
     }
 
-    func enqueue(meetingID: UUID, kinds: [MeetingAIJobKind]) async throws {
-        try await store.enqueueAIJobs(meetingID: meetingID, kinds: kinds)
+    func enqueueAutomaticJobs(meetingID: UUID, kinds: [MeetingAIJobKind]) async throws {
+        guard let meeting = try await meeting(id: meetingID) else { return }
+        let segments = try await exploitableSegments(meetingID: meetingID)
+        guard !segments.isEmpty else {
+            try await completePendingJobs(meetingID: meetingID, kinds: kinds)
+            return
+        }
+
+        let applicableKinds = kinds.filter { kind in
+            kind != .title || meeting.titleOrigin == .automatic
+        }
+        guard !applicableKinds.isEmpty else { return }
+        try await store.enqueueAIJobs(meetingID: meetingID, kinds: applicableKinds)
+    }
+
+    func reconcileAutomaticTitleJobs() async throws {
+        for job in try await store.pendingAIJobs() {
+            if try await exploitableSegments(meetingID: job.meetingID).isEmpty {
+                try await store.completeAIJob(meetingID: job.meetingID, kind: job.kind)
+            }
+        }
+
+        for meeting in try await store.meetings() where meeting.titleOrigin == .automatic {
+            guard try await !exploitableSegments(meetingID: meeting.id).isEmpty else { continue }
+            try await store.enqueueAIJobs(meetingID: meeting.id, kinds: [.title])
+        }
     }
 
     func pendingJobs() async throws -> [PendingMeetingAIJob] {
@@ -120,14 +144,38 @@ actor MeetingAIService {
         _ job: PendingMeetingAIJob,
         executablePath: String,
         configuration: CodexRunConfiguration
-    ) async throws -> RunResult {
-        let result = try await run(
-            kind: job.kind,
-            meetingID: job.meetingID,
-            executablePath: executablePath,
-            configuration: configuration
+    ) async throws -> RunResult? {
+        do {
+            let result = try await run(
+                kind: job.kind,
+                meetingID: job.meetingID,
+                executablePath: executablePath,
+                configuration: configuration
+            )
+            try await store.completeAIJob(meetingID: job.meetingID, kind: job.kind)
+            return result
+        } catch MeetingAIError.emptyTranscript {
+            try await store.completeAIJob(meetingID: job.meetingID, kind: job.kind)
+            return nil
+        }
+    }
+
+    private func meeting(id: UUID) async throws -> MeetingRecord? {
+        try await store.meetings().first { $0.id == id }
+    }
+
+    private func exploitableSegments(meetingID: UUID) async throws -> [TranscriptSegment] {
+        ExploitableTranscriptSelection.preferredSegments(
+            from: try await store.segments(meetingID: meetingID)
         )
-        try await store.completeAIJob(meetingID: job.meetingID, kind: job.kind)
-        return result
+    }
+
+    private func completePendingJobs(
+        meetingID: UUID,
+        kinds: [MeetingAIJobKind]
+    ) async throws {
+        for kind in kinds {
+            try await store.completeAIJob(meetingID: meetingID, kind: kind)
+        }
     }
 }

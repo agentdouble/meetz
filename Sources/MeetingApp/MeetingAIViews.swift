@@ -5,9 +5,12 @@ import SwiftUI
 struct MeetingAISettingsView: View {
     @EnvironmentObject private var aiController: MeetingAIController
     @Environment(\.dismiss) private var dismiss
+    @AppStorage(MeetingPreferenceKeys.showsTranscriptPanelDuringRecording)
+    private var showsTranscriptPanelDuringRecording = true
 
     private let modelOptions = [
         ("", "Configuration Codex"),
+        ("gpt-5.3-codex-spark", "GPT-5.3 Codex Spark — très rapide"),
         ("gpt-5.6-luna", "GPT-5.6 Luna — rapide"),
         ("gpt-5.6-terra", "GPT-5.6 Terra — équilibré"),
         ("gpt-5.6-sol", "GPT-5.6 Sol — qualité"),
@@ -20,7 +23,7 @@ struct MeetingAISettingsView: View {
                     Text("RÉGLAGES")
                         .font(.system(size: 11, weight: .semibold, design: .monospaced))
                         .tracking(1.4)
-                    Text("Intelligence artificielle")
+                    Text("Préférences")
                         .font(.title2.weight(.semibold))
                 }
                 Spacer()
@@ -32,6 +35,16 @@ struct MeetingAISettingsView: View {
             Divider()
 
             Form {
+                Section("Affichage") {
+                    Toggle(
+                        "Afficher le panneau de transcription pendant l’enregistrement",
+                        isOn: $showsTranscriptPanelDuringRecording
+                    )
+                    Text("Quand il est fermé, un indicateur compact reste visible. La transcription et la sauvegarde locale continuent, puis le panneau complet réapparaît à l’arrêt.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
                 Section("Lanceur") {
                     LabeledContent("Raccourci global") {
                         AIShortcutRecorder(shortcut: aiController.shortcut) {
@@ -137,17 +150,8 @@ struct MeetingAIPanelView: View {
 
     private var header: some View {
         HStack(alignment: .top, spacing: 12) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("ASSISTANT")
-                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                    .tracking(1.4)
-                Text("Discuter du transcript")
-                    .font(.headline)
-                Text(configurationLabel)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
+            Text("Assistant")
+                .font(.title2.weight(.semibold))
             Spacer()
             Button(action: aiController.closePanel) {
                 Image(systemName: "xmark")
@@ -158,11 +162,6 @@ struct MeetingAIPanelView: View {
             .accessibilityLabel("Fermer le chat")
         }
         .padding(18)
-    }
-
-    private var configurationLabel: String {
-        let model = aiController.codexModel.isEmpty ? "Modèle Codex" : aiController.codexModel
-        return "\(model) · \(aiController.codexReasoningEffort.displayName.lowercased())"
     }
 
     private var conversation: some View {

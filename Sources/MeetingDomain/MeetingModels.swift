@@ -136,9 +136,25 @@ public enum ExploitableTranscriptSelection {
         from segments: [TranscriptSegment]
     ) -> [TranscriptSegment] {
         let realtime = segments.filter { $0.source == .realtime }
-        return realtime.isEmpty
-            ? segments.filter { $0.source == .canonical }
-            : realtime
+        guard let realtimeStart = realtime.map(\.startTime).min() else {
+            return sorted(segments.filter { $0.source == .canonical })
+        }
+
+        // Lorsqu'une reunion est reprise, les segments canoniques precedant
+        // le nouveau direct font partie du contexte. Les segments canoniques
+        // produits pendant la consolidation courante restent exclus pour ne
+        // pas doubler le texte Nemotron encore visible.
+        let historicalCanonical = segments.filter {
+            $0.source == .canonical && $0.endTime <= realtimeStart + 0.01
+        }
+        return sorted(historicalCanonical + realtime)
+    }
+
+    private static func sorted(_ segments: [TranscriptSegment]) -> [TranscriptSegment] {
+        segments.sorted {
+            if $0.startTime == $1.startTime { return $0.createdAt < $1.createdAt }
+            return $0.startTime < $1.startTime
+        }
     }
 }
 

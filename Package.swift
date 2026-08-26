@@ -81,7 +81,13 @@ let package = Package(
         ),
         .executableTarget(
             name: "CaptureCoreChecks",
-            dependencies: ["AudioJournal", "CaptureCore", "MeetingDomain", "TranscriptStore"]
+            dependencies: [
+                "AudioJournal",
+                "CaptureCore",
+                "MeetingDomain",
+                "TranscriptStore",
+                "TranscriptionCore",
+            ]
         ),
         .executableTarget(
             name: "MeetingModelCheck",

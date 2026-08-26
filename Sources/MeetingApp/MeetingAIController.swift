@@ -45,6 +45,7 @@ final class MeetingAIController: ObservableObject {
     private let service: MeetingAIService?
     private let hotKeyManager = GlobalHotKeyManager()
     private var isProcessingPendingJobs = false
+    private var needsAnotherPendingJobsPass = false
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -209,7 +210,7 @@ final class MeetingAIController: ObservableObject {
             if automaticallyGenerateSummary { kinds.append(.summary) }
             guard !kinds.isEmpty else { return }
             do {
-                try await service.enqueue(meetingID: meetingID, kinds: kinds)
+                try await service.enqueueAutomaticJobs(meetingID: meetingID, kinds: kinds)
                 await resumePendingJobs()
             } catch {
                 lastError = error.localizedDescription
@@ -217,40 +218,63 @@ final class MeetingAIController: ObservableObject {
         }
     }
 
-    func resumePendingJobs() async {
-        guard !isProcessingPendingJobs, let service else { return }
-        isProcessingPendingJobs = true
-        defer { isProcessingPendingJobs = false }
+    func reconcileAutomaticTitles() async {
+        guard let service else { return }
         do {
-            for job in try await service.pendingJobs() {
-                runningKinds.insert(job.kind)
-                lastError = nil
-                do {
-                    let run = try await service.runPending(
-                        job,
-                        executablePath: codexExecutablePath,
-                        configuration: configuration
-                    )
-                    if resultsMeetingID == job.meetingID {
-                        results.insert(run.storedResult, at: 0)
-                    }
-                    lastCompletedKind = job.kind
-                    if run.didChangeMeetingTitle {
-                        NotificationCenter.default.post(
-                            name: .meetingAIDidUpdateMeeting,
-                            object: job.meetingID
-                        )
-                    }
-                } catch {
-                    lastError = error.localizedDescription
-                    runningKinds.remove(job.kind)
-                    break
-                }
-                runningKinds.remove(job.kind)
-            }
+            try await service.reconcileAutomaticTitleJobs()
+            await resumePendingJobs()
         } catch {
             lastError = error.localizedDescription
         }
+    }
+
+    func resumePendingJobs() async {
+        guard let service else { return }
+        guard !isProcessingPendingJobs else {
+            needsAnotherPendingJobsPass = true
+            return
+        }
+        isProcessingPendingJobs = true
+        defer { isProcessingPendingJobs = false }
+        var shouldStopAfterFailure = false
+        repeat {
+            needsAnotherPendingJobsPass = false
+            do {
+                for job in try await service.pendingJobs() {
+                    runningKinds.insert(job.kind)
+                    lastError = nil
+                    do {
+                        guard let run = try await service.runPending(
+                            job,
+                            executablePath: codexExecutablePath,
+                            configuration: configuration
+                        ) else {
+                            runningKinds.remove(job.kind)
+                            continue
+                        }
+                        if resultsMeetingID == job.meetingID {
+                            results.insert(run.storedResult, at: 0)
+                        }
+                        lastCompletedKind = job.kind
+                        if run.didChangeMeetingTitle {
+                            NotificationCenter.default.post(
+                                name: .meetingAIDidUpdateMeeting,
+                                object: job.meetingID
+                            )
+                        }
+                    } catch {
+                        lastError = error.localizedDescription
+                        runningKinds.remove(job.kind)
+                        shouldStopAfterFailure = true
+                        break
+                    }
+                    runningKinds.remove(job.kind)
+                }
+            } catch {
+                lastError = error.localizedDescription
+                shouldStopAfterFailure = true
+            }
+        } while needsAnotherPendingJobsPass && !shouldStopAfterFailure
     }
 
     private static func detectCodexExecutable() -> String {

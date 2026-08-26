@@ -74,6 +74,27 @@ public actor SQLiteTranscriptStore {
         )
     }
 
+    public func resumeMeeting(id: UUID) throws -> MeetingRecord {
+        try execute(
+            """
+            UPDATE meetings
+            SET ended_at = NULL, state = ?
+            WHERE id = ? AND state = ?;
+            """,
+            bindings: [
+                .text(MeetingState.recording.rawValue),
+                .text(id.uuidString),
+                .text(MeetingState.completed.rawValue),
+            ]
+        )
+        guard sqlite3_changes(database) == 1,
+              let meeting = try meetings().first(where: { $0.id == id })
+        else {
+            throw TranscriptStoreError.meetingCannotResume
+        }
+        return meeting
+    }
+
     public func recoverInterruptedMeetings(at recoveryDate: Date = Date()) throws {
         try execute(
             """
@@ -273,8 +294,8 @@ public actor SQLiteTranscriptStore {
             """
             SELECT meeting_id, kind, created_at
             FROM pending_meeting_ai_jobs
-            ORDER BY created_at ASC,
-                     CASE kind WHEN 'title' THEN 0 ELSE 1 END;
+            ORDER BY CASE kind WHEN 'title' THEN 0 ELSE 1 END,
+                     created_at ASC;
             """
         ) { statement in
             guard let meetingID = UUID(uuidString: Self.columnText(statement, index: 0)),
@@ -1048,6 +1069,7 @@ public enum TranscriptStoreError: LocalizedError, Sendable {
     case closed
     case invalidRow
     case invalidVoiceProfile
+    case meetingCannotResume
     case sqlite(String)
 
     public var errorDescription: String? {
@@ -1058,6 +1080,8 @@ public enum TranscriptStoreError: LocalizedError, Sendable {
             "Une ligne de la base Meeting est invalide."
         case .invalidVoiceProfile:
             "Le profil vocal local est invalide."
+        case .meetingCannotResume:
+            "Seule une reunion terminee peut etre reprise."
         case let .sqlite(message):
             "Erreur SQLite : \(message)"
         }

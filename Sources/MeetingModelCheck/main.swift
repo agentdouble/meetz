@@ -33,6 +33,20 @@ struct MeetingModelCheck {
         else {
             throw ModelCheckError.invalidRealtimeSegmentation
         }
+        var resumedSegmenter = RealtimeTranscriptSegmenter(
+            meetingID: UUID(),
+            input: .system,
+            timeOffset: 63.5
+        )
+        let resumedRealtime = resumedSegmenter.ingest(
+            cumulativeText: "La reunion reprend maintenant.",
+            processedAudioDuration: 2.24
+        )
+        guard resumedRealtime?.startTime == 63.5,
+              abs((resumedRealtime?.endTime ?? 0) - 65.74) < 0.000_001
+        else {
+            throw ModelCheckError.invalidRealtimeSegmentation
+        }
         print("ready realtime-persistence-segmentation=true")
 
         let identityEngine = try await CampPlusVoiceIdentityEngine.load { progress in
@@ -116,7 +130,19 @@ struct MeetingModelCheck {
             print(description(for: status))
         }
 
+        guard await engine.isReady else {
+            throw ModelCheckError.invalidRetainedModelLifecycle
+        }
+        await engine.replaceVoiceProfiles([reuseBaseline])
+        guard await engine.isReady else {
+            throw ModelCheckError.invalidRetainedModelLifecycle
+        }
+
         await engine.finish()
+        guard await !engine.isReady else {
+            throw ModelCheckError.invalidRetainedModelLifecycle
+        }
+        print("ready retained-batch-lifecycle=true")
         print("ready recorded-audio-batch=true bilingual-filter=false")
         print("OK: local batch transcription models are ready")
     }
@@ -174,4 +200,5 @@ private enum ModelCheckError: Error {
     case invalidVoiceClustering
     case invalidVoiceSamplePolicy
     case invalidRealtimeSegmentation
+    case invalidRetainedModelLifecycle
 }

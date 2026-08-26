@@ -5,6 +5,8 @@ import SwiftUI
 struct MeetingRootView: View {
     @EnvironmentObject private var controller: MeetingController
     @EnvironmentObject private var aiController: MeetingAIController
+    @AppStorage(MeetingPreferenceKeys.showsTranscriptPanelDuringRecording)
+    private var showsTranscriptPanelDuringRecording = true
     @State private var isShowingVoiceProfiles = false
     @State private var meetingToDelete: MeetingRecord?
 
@@ -14,7 +16,19 @@ struct MeetingRootView: View {
                 sidebar
                     .navigationSplitViewColumnWidth(min: 230, ideal: 260, max: 320)
             } detail: {
-                transcriptView
+                if controller.isRecording, !showsTranscriptPanelDuringRecording {
+                    CompactRecordingStatusView(
+                        microphoneLevel: controller.microphoneLevel,
+                        systemLevel: controller.systemLevel,
+                        status: controller.status,
+                        onOpenAssistant: aiController.openPanel,
+                        onShowTranscript: {
+                            showsTranscriptPanelDuringRecording = true
+                        }
+                    )
+                } else {
+                    transcriptView
+                }
             }
 
             if aiController.isShowingPanel {
@@ -31,7 +45,7 @@ struct MeetingRootView: View {
         .task {
             await controller.load()
             await aiController.loadResults(meetingID: controller.selectedMeetingID)
-            await aiController.resumePendingJobs()
+            await aiController.reconcileAutomaticTitles()
         }
         .sheet(isPresented: $isShowingVoiceProfiles) {
             VoiceProfilesView()
@@ -186,46 +200,83 @@ struct MeetingRootView: View {
             }
             Divider()
 
-            if controller.segments.isEmpty,
-               controller.realtimeSegments.isEmpty {
+            if controller.isLiveTranscriptSession {
+                liveTranscriptContent
+            } else if controller.storedSegmentsForDisplay.isEmpty {
                 emptyState
             } else {
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 20) {
-                            if controller.realtimeSegments.isEmpty {
-                                ForEach(controller.segments) { segment in
-                                    TranscriptSegmentView(segment: segment) { displayName in
-                                        controller.renameSpeaker(
-                                            segment: segment,
-                                            displayName: displayName
-                                        )
-                                    }
-                                        .id(segment.id)
-                                }
-                            } else {
-                                LiveTranscriptView(segments: controller.realtimeSegments)
-                                    .id("live-transcript")
-                            }
-                        }
-                        .padding(32)
-                        .frame(maxWidth: 820, alignment: .leading)
-                        .frame(maxWidth: .infinity)
-                    }
-                    .onChange(of: controller.segments.count) {
-                        if let last = controller.segments.last {
-                            withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
-                        }
-                    }
-                    .onChange(of: controller.realtimeSegments.map(\.text)) {
-                        if !controller.realtimeSegments.isEmpty {
-                            proxy.scrollTo("live-transcript", anchor: .bottom)
-                        }
-                    }
-                }
+                storedTranscriptContent
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private var liveTranscriptContent: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 20) {
+                    ForEach(controller.historicalSegmentsDuringLive) { segment in
+                        transcriptSegmentView(segment)
+                            .id(segment.id)
+                    }
+
+                    LiveTranscriptView(
+                        segments: controller.realtimeSegments,
+                        microphoneDraft: controller.microphoneDraft,
+                        systemDraft: controller.systemDraft,
+                        audioActivityStartedAt: controller.realtimeAudioActivityStartedAt,
+                        lastTextAt: controller.lastRealtimeTextAt,
+                        processingLag: controller.realtimeProcessingLag
+                    )
+                    .id("live-transcript")
+                }
+                .padding(32)
+                .frame(maxWidth: 820, alignment: .leading)
+                .frame(maxWidth: .infinity)
+            }
+            .onAppear {
+                proxy.scrollTo("live-transcript", anchor: .bottom)
+            }
+            .onChange(of: controller.realtimeSegments.map(\.text)) {
+                proxy.scrollTo("live-transcript", anchor: .bottom)
+            }
+            .onChange(of: controller.microphoneDraft) {
+                proxy.scrollTo("live-transcript", anchor: .bottom)
+            }
+            .onChange(of: controller.systemDraft) {
+                proxy.scrollTo("live-transcript", anchor: .bottom)
+            }
+        }
+    }
+
+    private var storedTranscriptContent: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 20) {
+                    ForEach(controller.storedSegmentsForDisplay) { segment in
+                        transcriptSegmentView(segment)
+                            .id(segment.id)
+                    }
+                }
+                .padding(32)
+                .frame(maxWidth: 820, alignment: .leading)
+                .frame(maxWidth: .infinity)
+            }
+            .onChange(of: controller.storedSegmentsForDisplay.count) {
+                if let last = controller.storedSegmentsForDisplay.last {
+                    withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                }
+            }
+        }
+    }
+
+    private func transcriptSegmentView(_ segment: TranscriptSegment) -> some View {
+        TranscriptSegmentView(segment: segment) { displayName in
+            controller.renameSpeaker(
+                segment: segment,
+                displayName: displayName
+            )
+        }
     }
 
     private var statusHeader: some View {
@@ -268,6 +319,16 @@ struct MeetingRootView: View {
             }
             if controller.isRecording {
                 CompactLevel(title: "MAC", level: controller.systemLevel)
+
+                Button {
+                    showsTranscriptPanelDuringRecording = false
+                } label: {
+                    Image(systemName: "rectangle.compress.vertical")
+                        .frame(width: 18, height: 18)
+                }
+                .buttonStyle(.plain)
+                .help("Fermer le panneau de transcription")
+                .accessibilityLabel("Fermer le panneau de transcription pendant l’enregistrement")
             }
 
             if controller.selectedMeetingID != nil {
@@ -278,6 +339,17 @@ struct MeetingRootView: View {
                 }
                 .buttonStyle(.borderless)
                 .help("Discuter du transcript")
+            }
+
+            if controller.canResumeSelectedMeeting {
+                Button {
+                    controller.resumeSelectedMeeting()
+                } label: {
+                    Label("Reprendre", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .help("Reprendre cette réunion et ajouter la suite au transcript")
+                .accessibilityLabel("Reprendre la réunion depuis ce transcript")
             }
 
             phaseIndicator

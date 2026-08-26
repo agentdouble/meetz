@@ -10,20 +10,24 @@ public struct RealtimeTranscriptSegmenter: Sendable {
     private let meetingID: UUID
     private let input: AudioInputKind
     private let segmentDuration: TimeInterval
+    private let timeOffset: TimeInterval
     private var segmentID = UUID()
     private var segmentIndex = 0
-    private var segmentStartTime: TimeInterval = 0
+    private var segmentStartTime: TimeInterval
     private var committedCumulativeText = ""
     private var lastCumulativeText = ""
 
     public init(
         meetingID: UUID,
         input: AudioInputKind,
-        segmentDuration: TimeInterval = Self.defaultSegmentDuration
+        segmentDuration: TimeInterval = Self.defaultSegmentDuration,
+        timeOffset: TimeInterval = 0
     ) {
         self.meetingID = meetingID
         self.input = input
         self.segmentDuration = max(2, segmentDuration)
+        self.timeOffset = max(0, timeOffset)
+        segmentStartTime = max(0, timeOffset)
     }
 
     public mutating func ingest(
@@ -52,7 +56,7 @@ public struct RealtimeTranscriptSegmenter: Sendable {
         lastCumulativeText = normalized
         guard !currentText.isEmpty else { return nil }
 
-        let endTime = max(segmentStartTime, processedAudioDuration)
+        let endTime = max(segmentStartTime, timeOffset + processedAudioDuration)
         let segment = TranscriptSegment(
             id: segmentID,
             meetingID: meetingID,

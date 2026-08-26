@@ -41,6 +41,12 @@ public actor FluidAudioBatchTranscriptionEngine: RecordedAudioTranscriptionEngin
         voiceProfileTracker = OnlineVoiceProfileTracker(profiles: voiceProfiles)
     }
 
+    public var isReady: Bool { isPrepared }
+
+    public func replaceVoiceProfiles(_ profiles: [VoiceProfile]) {
+        voiceProfileTracker = OnlineVoiceProfileTracker(profiles: profiles)
+    }
+
     public func prepare(
         statusHandler: @escaping @Sendable (TranscriptionEngineStatus) -> Void
     ) async throws {

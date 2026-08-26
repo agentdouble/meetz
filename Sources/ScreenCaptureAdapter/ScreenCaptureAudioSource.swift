@@ -3,6 +3,7 @@ import CaptureCore
 import CoreGraphics
 import CoreMedia
 import Foundation
+import OSLog
 import ScreenCaptureKit
 
 public enum ScreenCaptureAudioError: LocalizedError, Sendable {
@@ -26,6 +27,10 @@ public enum ScreenCaptureAudioError: LocalizedError, Sendable {
 }
 
 public final class ScreenCaptureAudioSource: NSObject, AudioCaptureSource, @unchecked Sendable {
+    private let logger = Logger(
+        subsystem: "com.jeremy.meeting",
+        category: "ScreenCaptureAudio"
+    )
     private let stateLock = NSLock()
     private let systemAudioQueue = DispatchQueue(
         label: "meeting.capture.system-audio",
@@ -35,6 +40,10 @@ public final class ScreenCaptureAudioSource: NSObject, AudioCaptureSource, @unch
         label: "meeting.capture.microphone",
         qos: .userInitiated
     )
+    private let screenKeepAliveQueue = DispatchQueue(
+        label: "meeting.capture.screen-keepalive",
+        qos: .utility
+    )
 
     private var stream: SCStream?
     private var eventHandler: (@Sendable (AudioCaptureEvent) -> Void)?
@@ -42,6 +51,8 @@ public final class ScreenCaptureAudioSource: NSObject, AudioCaptureSource, @unch
     private var microphoneBufferCount: UInt64 = 0
     private var systemSampleCount: UInt64 = 0
     private var microphoneSampleCount: UInt64 = 0
+    private var systemConversionErrorCount: UInt64 = 0
+    private var microphoneConversionErrorCount: UInt64 = 0
     private let systemSampleConverter = AudioSampleConverter()
     private let microphoneSampleConverter = AudioSampleConverter()
 
@@ -100,6 +111,16 @@ public final class ScreenCaptureAudioSource: NSObject, AudioCaptureSource, @unch
                 delegate: self
             )
 
+            // SCStream reste une capture d'ecran meme lorsque Meeting ne
+            // consomme que l'audio. Sans sortie .screen, ScreenCaptureKit
+            // signale continuellement des frames sans destinataire et peut
+            // interrompre une session longue. Les images 2x2 a 1 Hz sont
+            // recues puis immediatement ignorees, sans aucun stockage.
+            try newStream.addStreamOutput(
+                self,
+                type: .screen,
+                sampleHandlerQueue: screenKeepAliveQueue
+            )
             try newStream.addStreamOutput(
                 self,
                 type: .audio,
@@ -142,6 +163,8 @@ public final class ScreenCaptureAudioSource: NSObject, AudioCaptureSource, @unch
             microphoneBufferCount = 0
             systemSampleCount = 0
             microphoneSampleCount = 0
+            systemConversionErrorCount = 0
+            microphoneConversionErrorCount = 0
         }
     }
 
@@ -153,6 +176,8 @@ public final class ScreenCaptureAudioSource: NSObject, AudioCaptureSource, @unch
             microphoneBufferCount = 0
             systemSampleCount = 0
             microphoneSampleCount = 0
+            systemConversionErrorCount = 0
+            microphoneConversionErrorCount = 0
         }
     }
 
@@ -238,6 +263,24 @@ public final class ScreenCaptureAudioSource: NSObject, AudioCaptureSource, @unch
             )
         )
     }
+
+    private func recordConversionError(_ error: Error, input: AudioInputKind) {
+        let count: UInt64 = stateLock.withLock {
+            switch input {
+            case .system:
+                systemConversionErrorCount += 1
+                return systemConversionErrorCount
+            case .microphone:
+                microphoneConversionErrorCount += 1
+                return microphoneConversionErrorCount
+            }
+        }
+        if count == 1 || count.isMultiple(of: 100) {
+            logger.error(
+                "Audio conversion skipped input=\(input.rawValue, privacy: .public) failures=\(count, privacy: .public) error=\(error.localizedDescription, privacy: .public)"
+            )
+        }
+    }
 }
 
 extension ScreenCaptureAudioSource: SCStreamOutput, SCStreamDelegate {
@@ -273,11 +316,16 @@ extension ScreenCaptureAudioSource: SCStreamOutput, SCStreamDelegate {
             )
             publishSamples(samples, input: input)
         } catch {
-            // A malformed buffer is skipped. ScreenCaptureKit will deliver the next one.
+            // Un buffer malforme ne doit pas arreter toute la reunion, mais la
+            // perte reste observable et comptee pour diagnostiquer la source.
+            recordConversionError(error, input: input)
         }
     }
 
     public func stream(_ stream: SCStream, didStopWithError error: any Error) {
+        logger.error(
+            "ScreenCaptureKit stopped unexpectedly error=\(error.localizedDescription, privacy: .public)"
+        )
         let handler = stateLock.withLock { eventHandler }
         handler?(.stopped(reason: error.localizedDescription))
         clearState()

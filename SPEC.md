@@ -80,6 +80,7 @@ La distribution commerciale, la synchronisation entre appareils et le fonctionne
 2. L'utilisateur peut modifier son titre et les noms des intervenants.
 3. Il peut corriger, copier, rechercher ou exporter le transcript.
 4. Aucun fichier audio n'est expose ; les blocs temporaires deja transcrits sont supprimes automatiquement.
+5. Il peut reprendre une reunion terminee : la nouvelle capture complete le meme transcript et continue ses horodatages.
 
 ## 7. Ecrans
 
@@ -113,6 +114,7 @@ La distribution commerciale, la synchronisation entre appareils et le fonctionne
 
 - Titre editable.
 - Transcript complet.
+- Bouton `Reprendre` pour ajouter une nouvelle session audio a une reunion terminee.
 - Edition et renommage des intervenants.
 - Recherche interne.
 - Copie et export en Markdown, texte et JSON.
@@ -207,18 +209,23 @@ protocol SpeakerDiarizationEngine {
 }
 ```
 
-Choix initial pour le prototype : FluidAudio, avec Nemotron multilingue Latin en streaming pour la previsualisation francaise/anglaise, Parakeet TDT v3 multilingue pour le transcript canonique et LS-EEND pour la diarisation. Ce choix n'est valide pour la production qu'apres benchmark sur le Mac M2 32 Go.
+Choix initial pour le prototype : FluidAudio, avec Nemotron multilingue Latin 2 240 ms en streaming pour la previsualisation francaise/anglaise, Parakeet TDT v3 multilingue pour le transcript canonique et LS-EEND pour la diarisation. Le tier 560 ms a produit un retard croissant sur deux flux reels complexes ; le tier 2 240 ms recommande par FluidAudio est retenu pour tenir le temps reel. Ce choix n'est valide pour la production qu'apres benchmark sur le Mac M2 32 Go.
 
 Un adaptateur WhisperKit `large-v3-turbo` doit rester possible si le benchmark francais montre une qualite nettement superieure. Le stockage et l'interface ne doivent connaitre aucun type propre a FluidAudio ou WhisperKit.
 
 ### Strategie incrementale robuste
 
 - L'audio est journalise sur disque en continu, independamment de la vitesse des moteurs d'inference.
+- La capture duplique immediatement chaque paquet vers le journal durable et le moteur direct ; aucun des deux consommateurs ne se trouve derriere l'autre. Le journal regroupe les micro-buffers en ecritures de 100 ms pour rester au rythme de la capture.
+- Le flux ScreenCaptureKit attache une sortie ecran minimale 2x2 a 1 Hz, immediatement ignoree et jamais stockee, afin de maintenir la session audio longue sans frames video orphelines.
 - Pendant la capture, Nemotron est le seul moteur d'inference actif et produit du texte toutes les 2,24 secondes environ, sans remise a zero aux frontieres des blocs WAV.
+- Les buffers de capture de 10 a 20 ms sont regroupes par canal en paquets ASR de 100 ms. Le regroupement conserve chaque echantillon et vide son dernier paquet incomplet a l'arret ; le journal durable continue de recevoir les buffers originaux.
+- Les files de previsualisation sont bornees independamment. Une saturation abandonne uniquement les plus anciens paquets Nemotron, signale le retard et conserve integralement le journal audio destine a la consolidation canonique.
 - Le texte cumulatif Nemotron est decoupe en segments `realtime` d'environ 20 secondes. Chaque segment possede un identifiant stable, un canal et un horodatage, puis est mis a jour sans doublon dans SQLite.
 - Les segments `realtime` font partie du contrat de transcript et peuvent alimenter Codex avant la fin de la reunion ; ils ne sont pas de simples elements visuels.
 - Les blocs WAV finalises attendent dans une file de metadonnees dedoublonnee ; leur contenu est deja durable et recuperable apres un crash.
-- A l'arret, Nemotron est draine puis libere avant que Parakeet et LS-EEND consolident les blocs en segments canoniques. Les deux familles de modeles ne se disputent ainsi pas le Neural Engine.
+- Au lancement de l'application, Nemotron, Parakeet, LS-EEND et le moteur de signatures vocales sont charges et valides avant la premiere reunion. L'interface expose l'etat `Modeles locaux prets`.
+- A l'arret d'une reunion, Nemotron est draine puis sa session est remise a zero sans decharger ses modeles. Parakeet et LS-EEND, deja residents mais inactifs pendant la capture, consolident ensuite les blocs en segments canoniques. Tous les moteurs sont reutilises par la reunion suivante sans nouveau chargement et ne sont liberes qu'a la fermeture de l'application.
 - Le transcript direct reste visible pendant la consolidation. Il est supprime seulement apres la reussite de tous les blocs canoniques ; en cas d'echec, il reste la version exploitable de secours.
 - Une pause peut fermer un bloc apres 20 secondes ; la duree maximale est 30 secondes.
 - Le microphone et le son systeme ont des files et des fichiers distincts.
@@ -310,6 +317,7 @@ Obsidian reste un ensemble de notes Markdown structurees. Une vue Obsidian Bases
 - File SQLite durable pour reprendre les traitements automatiques apres une fermeture de l'application.
 - Origine du titre conservee (`automatic`, `user`, `ai`) afin que Codex ne remplace jamais un titre saisi manuellement.
 - Titre et resume lances en sequence a la fin d'une reunion ; questions et prochaines etapes disponibles a la demande.
+- Les titres sont prioritaires dans la file durable. Un transcript vide est ignore sans bloquer les suivants et les reunions encore sans titre explicite sont rattrapees au prochain lancement.
 - Resultats JSON conserves localement et rattaches a la reunion ; aucun audio n'est transmis.
 - Reglages SwiftUI pour le chemin Codex, les automatismes et un raccourci global personnalisable.
 
@@ -321,6 +329,21 @@ Obsidian reste un ensemble de notes Markdown structurees. Une vue Obsidian Bases
 - Chaque appel relit le transcript exploitable courant et un historique borne de conversation ; aucune session Codex durable nest requise.
 - Les reglages permettent de choisir le modele Codex et leffort de raisonnement. Ces options sappliquent aussi au titre et au resume automatiques.
 - `codex exec` reste ephemere, en sandbox lecture seule, avec une sortie JSON validee ; aucun fichier audio nest transmis.
+
+### Reprise d'une reunion terminee implementee le 2026-08-26
+
+- Le bouton `Reprendre` rouvre atomiquement la reunion selectionnee au lieu de creer un second transcript.
+- Le dernier `endTime` persiste devient l'origine temporelle de la nouvelle capture ; Nemotron, le journal WAV et la consolidation Parakeet continuent tous les memes horodatages.
+- Pendant la reprise, l'interface et Codex combinent les anciens segments canoniques avec le nouveau direct. Les segments canoniques de la passe courante restent masques jusqu'a la fin pour eviter les doublons.
+- Chaque instance du journal audio ajoute un identifiant de session au nom des nouveaux blocs. Une reprise apres redemarrage ne peut donc pas reutiliser par erreur l'identifiant d'un ancien bloc deja acquitte.
+- Seule une reunion `completed` peut etre reprise. Une seconde reprise simultanee est refusee par SQLite.
+
+### Fermeture du panneau transcript pendant la capture implementee le 2026-08-26
+
+- Un reglage persistant et une action rapide dans l'entete permettent de fermer ou rouvrir tout le panneau titre, contexte et transcript pendant une reunion.
+- Le panneau ferme est remplace par une carte compacte indiquant la capture active, les niveaux MIC/MAC et une action de reouverture.
+- La fermeture est uniquement visuelle : capture, journal audio temporaire, segments `realtime`, consolidation et acces Codex restent actifs.
+- Le panneau complet et le transcript consolide reapparaissent automatiquement apres l'arret.
 
 ## 14. Hors scope MVP
 
@@ -345,7 +368,7 @@ Obsidian reste un ensemble de notes Markdown structurees. Une vue Obsidian Bases
 
 ### Transcription
 
-- Le francais est force ou privilegie par le moteur.
+- Le moteur conserve la langue source : le francais reste en francais et l'anglais reste en anglais. Aucune traduction implicite n'est autorisee ; une future traduction directe sera une option explicite et separee.
 - Le texte apparait pendant la reunion et les revisions provisoires ne creent pas de doublons.
 - `Moi` est distingue des participants distants.
 - Les participants distants obtiennent des labels distincts dans les conditions normales de test.
@@ -368,6 +391,7 @@ Obsidian reste un ensemble de notes Markdown structurees. Une vue Obsidian Bases
 
 - Les objectifs de retard et de memoire de la section Performance sont mesures sur cette machine.
 - Le premier texte partiel doit apparaitre apres environ 2,24 secondes d'audio, avec un objectif visible inferieur a 3 secondes hors chargement initial.
+- Avant le premier texte, l'interface distingue explicitement l'ecoute silencieuse, le son detecte en cours de transcription et un retard superieur a douze secondes. Le brouillon moteur sert de secours visuel avant le premier segment SQLite ; aucune reunion active ne presente une zone vide ambigue.
 - Le moteur temps reel doit traiter chaque fenetre plus vite que sa duree et cohabiter avec le batch sans accumulation continue de la file audio.
 - Un corpus francais representatif valide la ponctuation, les nombres, les noms propres et les changements d'intervenants.
 - Le moteur final est choisi apres comparaison documentee de la precision, de la latence, de la memoire et de la licence.

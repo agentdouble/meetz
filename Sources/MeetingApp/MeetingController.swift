@@ -32,6 +32,7 @@ final class MeetingController: ObservableObject {
     @Published private(set) var realtimeSegments: [TranscriptSegment] = []
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var status = "Pret"
+    @Published private(set) var areModelsReady = false
     @Published private(set) var preparationProgress: Double?
     @Published private(set) var voiceEnrollmentProgress: Double?
     @Published private(set) var hasVoiceProfile = false
@@ -41,13 +42,16 @@ final class MeetingController: ObservableObject {
     @Published private(set) var microphoneDraft = ""
     @Published private(set) var microphoneDraftSpeaker = "Micro du Mac"
     @Published private(set) var systemDraft = ""
+    @Published private(set) var realtimeAudioActivityStartedAt: Date?
+    @Published private(set) var lastRealtimeTextAt: Date?
+    @Published private(set) var realtimeProcessingLag: TimeInterval = 0
     @Published var selectedMeetingID: UUID?
 
     private let captureSource: any AudioCaptureSource
     private let store: SQLiteTranscriptStore?
     private let audioJournal: DurableAudioJournal?
-    private var engine: (any RecordedAudioTranscriptionEngine)?
-    private var previewEngine: (any RealtimePreviewTranscriptionEngine)?
+    private var engine: FluidAudioBatchTranscriptionEngine?
+    private var previewEngine: FluidAudioRealtimePreviewEngine?
     private var currentMeeting: MeetingRecord?
     private var microphoneAudioContinuation: AsyncStream<AudioChunk>.Continuation?
     private var systemAudioContinuation: AsyncStream<AudioChunk>.Continuation?
@@ -66,6 +70,10 @@ final class MeetingController: ObservableObject {
     private var enrollmentTask: Task<Void, Never>?
     private var profileNameOverrides: [String: String] = [:]
     private var meetingSpeakerNameOverrides: [MeetingSpeakerKey: String] = [:]
+    private var realtimePreviewCounts: [AudioInputKind: Int] = [:]
+    private var realtimeProcessedDurations: [AudioInputKind: TimeInterval] = [:]
+    private var realtimeCaptureStartedAt: Date?
+    private var didLogRealtimeLagWarning = false
 
     init(
         captureSource: any AudioCaptureSource = ScreenCaptureAudioSource()
@@ -85,6 +93,7 @@ final class MeetingController: ObservableObject {
     }
 
     var isRecording: Bool { phase == .recording }
+    var isLiveTranscriptSession: Bool { phase == .recording || phase == .stopping }
     var isEnrolling: Bool { phase == .enrolling }
     var isBusy: Bool { phase == .preparing || phase == .enrolling || phase == .stopping }
     var canManageVoiceProfile: Bool {
@@ -94,6 +103,22 @@ final class MeetingController: ObservableObject {
         meetings.first { $0.id == selectedMeetingID }
     }
     var canDeleteSelectedMeeting: Bool { currentMeeting == nil && !isBusy }
+    var canResumeSelectedMeeting: Bool {
+        currentMeeting == nil
+            && !isBusy
+            && selectedMeeting?.state == .completed
+    }
+    var historicalSegmentsDuringLive: [TranscriptSegment] {
+        guard !realtimeSegments.isEmpty else { return segments }
+        return ExploitableTranscriptSelection.preferredSegments(
+            from: segments + realtimeSegments
+        ).filter { $0.source == .canonical }
+    }
+    var storedSegmentsForDisplay: [TranscriptSegment] {
+        ExploitableTranscriptSelection.preferredSegments(
+            from: segments + realtimeSegments
+        )
+    }
 
     func load() async {
         if !didRecoverInterruptedMeetings {
@@ -113,6 +138,9 @@ final class MeetingController: ObservableObject {
             selectedMeetingID = meetings.first?.id
         }
         await loadSelectedMeeting()
+        if currentMeeting == nil, !areModelsReady, phase != .preparing {
+            await preloadTranscriptionEngines()
+        }
     }
 
     func selectMeeting(_ id: UUID?) {
@@ -121,6 +149,15 @@ final class MeetingController: ObservableObject {
     }
 
     func startMeeting() {
+        beginMeeting(resuming: nil)
+    }
+
+    func resumeSelectedMeeting() {
+        guard canResumeSelectedMeeting, let selectedMeeting else { return }
+        beginMeeting(resuming: selectedMeeting)
+    }
+
+    private func beginMeeting(resuming meetingToResume: MeetingRecord?) {
         guard phase == .idle || isFailed else { return }
         guard let store, let audioJournal else {
             phase = .failed("Le stockage local n'est pas disponible.")
@@ -128,65 +165,75 @@ final class MeetingController: ObservableObject {
         }
 
         phase = .preparing
-        logger.info("Meeting preparation started")
-        status = "Preparation du modele francais local..."
+        logger.info("Meeting preparation started resumed=\(meetingToResume != nil, privacy: .public)")
+        status = meetingToResume == nil
+            ? "Demarrage de la capture..."
+            : "Preparation de la reprise..."
         preparationProgress = nil
         microphoneDraft = ""
         systemDraft = ""
-        segments = []
+        realtimeAudioActivityStartedAt = nil
+        lastRealtimeTextAt = nil
+        realtimeProcessingLag = 0
+        realtimePreviewCounts = [:]
+        realtimeProcessedDurations = [:]
+        realtimeCaptureStartedAt = nil
+        didLogRealtimeLagWarning = false
         realtimeSegments = []
+        if meetingToResume == nil {
+            segments = []
+        }
 
         Task {
             do {
-                let meeting = try await store.createMeeting()
+                let meeting: MeetingRecord
+                let timeOffset: TimeInterval
+                if let meetingToResume {
+                    let storedSegments = try await store.segments(meetingID: meetingToResume.id)
+                    meeting = try await store.resumeMeeting(id: meetingToResume.id)
+                    timeOffset = Self.resumeOffset(from: storedSegments)
+                    segments = storedSegments.filter { $0.source == .canonical }
+                    if let index = meetings.firstIndex(where: { $0.id == meeting.id }) {
+                        meetings[index] = meeting
+                    }
+                } else {
+                    meeting = try await store.createMeeting()
+                    timeOffset = 0
+                    meetings.insert(meeting, at: 0)
+                }
+
                 currentMeeting = meeting
                 selectedMeetingID = meeting.id
-                meetings.insert(meeting, at: 0)
                 realtimeSegmenters = [
                     .microphone: RealtimeTranscriptSegmenter(
                         meetingID: meeting.id,
-                        input: .microphone
+                        input: .microphone,
+                        timeOffset: timeOffset
                     ),
                     .system: RealtimeTranscriptSegmenter(
                         meetingID: meeting.id,
-                        input: .system
+                        input: .system,
+                        timeOffset: timeOffset
                     ),
                 ]
 
-                let engine = FluidAudioBatchTranscriptionEngine(voiceProfiles: voiceProfiles)
-                self.engine = engine
-                try await engine.prepare { [weak self] engineStatus in
-                    Task { @MainActor [weak self] in
-                        self?.apply(engineStatus)
-                    }
-                }
-                let previewEngine = FluidAudioRealtimePreviewEngine()
-                self.previewEngine = previewEngine
-                try await previewEngine.prepare { [weak self] engineStatus in
-                    Task { @MainActor [weak self] in
-                        self?.apply(engineStatus)
-                    }
-                }
+                let (_, previewEngine) = try await preparedTranscriptionEngines()
                 try await previewEngine.start { [weak self] preview in
                     Task { @MainActor [weak self] in
                         self?.acceptRealtimePreview(preview)
                     }
                 }
-                let continuations = configureAudioPipeline(
+                let audioFanout = configureAudioPipeline(
                     meetingID: meeting.id,
                     journal: audioJournal,
-                    previewEngine: previewEngine
+                    previewEngine: previewEngine,
+                    timeOffset: timeOffset
                 )
 
                 try await captureSource.start { [weak self] event in
                     switch event {
                     case let .samples(chunk):
-                        switch chunk.input {
-                        case .microphone:
-                            continuations.microphone.yield(chunk)
-                        case .system:
-                            continuations.system.yield(chunk)
-                        }
+                        audioFanout.yield(chunk)
                     case .level, .stopped:
                         Task { @MainActor [weak self] in
                             self?.acceptCaptureEvent(event)
@@ -194,8 +241,11 @@ final class MeetingController: ObservableObject {
                     }
                 }
 
+                realtimeCaptureStartedAt = Date()
                 phase = .recording
-                status = "Transcription temps reel · sauvegarde locale robuste"
+                status = meetingToResume == nil
+                    ? "Transcription temps reel · sauvegarde locale robuste"
+                    : "Reunion reprise à \(Self.formatTimestamp(timeOffset)) · sauvegarde locale"
                 preparationProgress = nil
                 logger.info("Meeting capture and transcription active")
             } catch {
@@ -530,7 +580,13 @@ final class MeetingController: ObservableObject {
             case .system:
                 systemLevel = snapshot.linearLevel
             }
+            if snapshot.linearLevel >= 0.008, realtimeAudioActivityStartedAt == nil {
+                realtimeAudioActivityStartedAt = Date()
+            }
         case let .stopped(reason):
+            logger.error(
+                "Capture source stopped phase=\(String(describing: self.phase), privacy: .public) reason=\(reason, privacy: .public)"
+            )
             if phase == .recording {
                 phase = .stopping
                 status = "Capture interrompue · sauvegarde du son restant"
@@ -548,6 +604,19 @@ final class MeetingController: ObservableObject {
 
     private func acceptRealtimePreview(_ preview: RealtimeTranscriptPreview) {
         let normalizedText = preview.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !normalizedText.isEmpty {
+            lastRealtimeTextAt = Date()
+            realtimePreviewCounts[preview.input, default: 0] += 1
+            if realtimePreviewCounts[preview.input] == 1 {
+                let processedSeconds = String(
+                    format: "%.2f",
+                    preview.processedAudioDuration
+                )
+                logger.info(
+                    "First realtime text input=\(preview.input.rawValue, privacy: .public) processed_seconds=\(processedSeconds, privacy: .public) characters=\(normalizedText.count, privacy: .public)"
+                )
+            }
+        }
         switch preview.input {
         case .microphone:
             microphoneDraft = normalizedText
@@ -565,16 +634,24 @@ final class MeetingController: ObservableObject {
         else { return }
         realtimeSegmenters[preview.input] = segmenter
         upsertVisibleRealtimeSegment(segment)
+        let updateCount = realtimePreviewCounts[preview.input, default: 0]
+        if updateCount == 1 || updateCount.isMultiple(of: 10) {
+            let detectedLanguage = preview.detectedLanguage ?? "unknown"
+            logger.info(
+                "Realtime text published input=\(preview.input.rawValue, privacy: .public) language=\(detectedLanguage, privacy: .public) updates=\(updateCount, privacy: .public) visible_segments=\(self.realtimeSegments.count, privacy: .public) characters=\(normalizedText.count, privacy: .public)"
+            )
+        }
         enqueueRealtimePersistence(segment, meetingID: meetingID)
     }
 
     private func upsertVisibleRealtimeSegment(_ segment: TranscriptSegment) {
-        if let index = realtimeSegments.firstIndex(where: { $0.id == segment.id }) {
-            realtimeSegments[index] = segment
+        var updatedSegments = realtimeSegments
+        if let index = updatedSegments.firstIndex(where: { $0.id == segment.id }) {
+            updatedSegments[index] = segment
         } else {
-            realtimeSegments.append(segment)
+            updatedSegments.append(segment)
         }
-        realtimeSegments.sort {
+        realtimeSegments = updatedSegments.sorted {
             if $0.startTime == $1.startTime { return $0.createdAt < $1.createdAt }
             return $0.startTime < $1.startTime
         }
@@ -698,11 +775,9 @@ final class MeetingController: ObservableObject {
     private func configureAudioPipeline(
         meetingID: UUID,
         journal: DurableAudioJournal,
-        previewEngine: any RealtimePreviewTranscriptionEngine
-    ) -> (
-        microphone: AsyncStream<AudioChunk>.Continuation,
-        system: AsyncStream<AudioChunk>.Continuation
-    ) {
+        previewEngine: any RealtimePreviewTranscriptionEngine,
+        timeOffset: TimeInterval
+    ) -> AudioChunkFanout {
         pipelineFailureMessage = nil
         let (microphoneStream, microphoneContinuation) = AsyncStream<AudioChunk>.makeStream(
             bufferingPolicy: .unbounded
@@ -711,12 +786,13 @@ final class MeetingController: ObservableObject {
             bufferingPolicy: .unbounded
         )
         let (microphonePreviewStream, microphonePreviewContinuation) = AsyncStream<AudioChunk>.makeStream(
-            bufferingPolicy: .unbounded
+            bufferingPolicy: .bufferingNewest(600)
         )
         let (systemPreviewStream, systemPreviewContinuation) = AsyncStream<AudioChunk>.makeStream(
-            bufferingPolicy: .unbounded
+            bufferingPolicy: .bufferingNewest(300)
         )
         let deferredAudioBlockQueue = DeferredAudioBlockQueue()
+        let previewDropCounter = AudioChunkDropCounter()
 
         microphoneAudioContinuation = microphoneContinuation
         systemAudioContinuation = systemContinuation
@@ -725,47 +801,173 @@ final class MeetingController: ObservableObject {
         self.deferredAudioBlockQueue = deferredAudioBlockQueue
 
         microphoneJournalTask = Task { [weak self] in
+            var batcher = RealtimeAudioChunkBatcher()
             for await chunk in microphoneStream {
-                do {
-                    let blocks = try await journal.append(chunk, meetingID: meetingID)
-                    microphonePreviewContinuation.yield(chunk)
-                    await deferredAudioBlockQueue.enqueue(contentsOf: blocks)
-                } catch {
-                    self?.recordPipelineFailure(error)
+                for batch in batcher.append(chunk) {
+                    await self?.appendToJournal(
+                        batch,
+                        meetingID: meetingID,
+                        timeOffset: timeOffset,
+                        journal: journal,
+                        deferredQueue: deferredAudioBlockQueue
+                    )
                 }
+            }
+            if let remainder = batcher.finish() {
+                await self?.appendToJournal(
+                    remainder,
+                    meetingID: meetingID,
+                    timeOffset: timeOffset,
+                    journal: journal,
+                    deferredQueue: deferredAudioBlockQueue
+                )
             }
         }
         systemJournalTask = Task { [weak self] in
+            var batcher = RealtimeAudioChunkBatcher()
             for await chunk in systemStream {
-                do {
-                    let blocks = try await journal.append(chunk, meetingID: meetingID)
-                    systemPreviewContinuation.yield(chunk)
-                    await deferredAudioBlockQueue.enqueue(contentsOf: blocks)
-                } catch {
-                    self?.recordPipelineFailure(error)
+                for batch in batcher.append(chunk) {
+                    await self?.appendToJournal(
+                        batch,
+                        meetingID: meetingID,
+                        timeOffset: timeOffset,
+                        journal: journal,
+                        deferredQueue: deferredAudioBlockQueue
+                    )
                 }
+            }
+            if let remainder = batcher.finish() {
+                await self?.appendToJournal(
+                    remainder,
+                    meetingID: meetingID,
+                    timeOffset: timeOffset,
+                    journal: journal,
+                    deferredQueue: deferredAudioBlockQueue
+                )
             }
         }
         microphonePreviewTask = Task { [weak self] in
+            var batcher = RealtimeAudioChunkBatcher()
             for await chunk in microphonePreviewStream {
+                for batch in batcher.append(chunk) {
+                    do {
+                        try await previewEngine.ingest(batch)
+                        self?.acceptRealtimeProgress(batch)
+                    } catch {
+                        self?.recordPreviewFailure(error)
+                    }
+                }
+            }
+            if let remainder = batcher.finish() {
                 do {
-                    try await previewEngine.ingest(chunk)
+                    try await previewEngine.ingest(remainder)
+                    self?.acceptRealtimeProgress(remainder)
                 } catch {
                     self?.recordPreviewFailure(error)
                 }
             }
         }
         systemPreviewTask = Task { [weak self] in
+            var batcher = RealtimeAudioChunkBatcher()
             for await chunk in systemPreviewStream {
+                for batch in batcher.append(chunk) {
+                    do {
+                        try await previewEngine.ingest(batch)
+                        self?.acceptRealtimeProgress(batch)
+                    } catch {
+                        self?.recordPreviewFailure(error)
+                    }
+                }
+            }
+            if let remainder = batcher.finish() {
                 do {
-                    try await previewEngine.ingest(chunk)
+                    try await previewEngine.ingest(remainder)
+                    self?.acceptRealtimeProgress(remainder)
                 } catch {
                     self?.recordPreviewFailure(error)
                 }
             }
         }
 
-        return (microphoneContinuation, systemContinuation)
+        return AudioChunkFanout(
+            sinks: [
+                { chunk in
+                    switch chunk.input {
+                    case .microphone:
+                        microphoneContinuation.yield(chunk)
+                    case .system:
+                        systemContinuation.yield(chunk)
+                    }
+                },
+                { chunk in
+                    let result: AsyncStream<AudioChunk>.Continuation.YieldResult
+                    switch chunk.input {
+                    case .microphone:
+                        result = microphonePreviewContinuation.yield(chunk)
+                    case .system:
+                        result = systemPreviewContinuation.yield(chunk)
+                    }
+                    if case .dropped = result {
+                        let count = previewDropCounter.record(input: chunk.input)
+                        if count == 1 || count.isMultiple(of: 100) {
+                            Task { @MainActor [weak self] in
+                                self?.recordPreviewDrop(input: chunk.input, count: count)
+                            }
+                        }
+                    }
+                },
+            ]
+        )
+    }
+
+    private func acceptRealtimeProgress(_ chunk: AudioChunk) {
+        let processedDuration = max(0, chunk.startTime + chunk.duration)
+        realtimeProcessedDurations[chunk.input] = max(
+            realtimeProcessedDurations[chunk.input, default: 0],
+            processedDuration
+        )
+        guard let realtimeCaptureStartedAt else { return }
+
+        let captureDuration = Date().timeIntervalSince(realtimeCaptureStartedAt)
+        let slowestProcessedDuration = AudioInputKind.allCases
+            .compactMap { realtimeProcessedDurations[$0] }
+            .min() ?? 0
+        realtimeProcessingLag = max(0, captureDuration - slowestProcessedDuration)
+        if realtimeProcessingLag >= LiveTranscriptPresentation.delayWarningInterval,
+           !didLogRealtimeLagWarning {
+            didLogRealtimeLagWarning = true
+            let lagSeconds = String(format: "%.2f", realtimeProcessingLag)
+            logger.warning(
+                "Realtime transcription lagging seconds=\(lagSeconds, privacy: .public)"
+            )
+        } else if realtimeProcessingLag < 3 {
+            didLogRealtimeLagWarning = false
+        }
+    }
+
+    private func recordPreviewDrop(input: AudioInputKind, count: Int) {
+        logger.warning(
+            "Realtime preview backlog bounded input=\(input.rawValue, privacy: .public) dropped_chunks=\(count, privacy: .public)"
+        )
+        if phase == .recording {
+            status = "Direct en retard · audio integral protege pour la consolidation"
+        }
+    }
+
+    private func appendToJournal(
+        _ chunk: AudioChunk,
+        meetingID: UUID,
+        timeOffset: TimeInterval,
+        journal: DurableAudioJournal,
+        deferredQueue: DeferredAudioBlockQueue
+    ) async {
+        do {
+            let journalChunk = Self.offset(chunk, by: timeOffset)
+            let blocks = try await journal.append(journalChunk, meetingID: meetingID)
+            await deferredQueue.enqueue(contentsOf: blocks)
+        } catch {
+            recordPipelineFailure(error)
+        }
     }
 
     private func processAudioBlock(
@@ -837,8 +1039,7 @@ final class MeetingController: ObservableObject {
         microphonePreviewTask = nil
         systemPreviewTask = nil
 
-        await previewEngine?.finish()
-        previewEngine = nil
+        await previewEngine?.stopSession()
         await realtimePersistenceTask?.value
         realtimePersistenceTask = nil
 
@@ -865,8 +1066,6 @@ final class MeetingController: ObservableObject {
         } else if !deferredBlocks.isEmpty {
             recordPipelineFailure(MeetingPipelineError.transcriptionEngineUnavailable)
         }
-        await engine?.finish()
-
         if pipelineFailureMessage == nil {
             do {
                 try await store?.deleteRealtimeSegments(meetingID: meetingID)
@@ -885,13 +1084,19 @@ final class MeetingController: ObservableObject {
             recordPipelineFailure(error)
         }
 
-        engine = nil
         currentMeeting = nil
         microphoneLevel = 0
         systemLevel = 0
         microphoneDraft = ""
         microphoneDraftSpeaker = "Micro du Mac"
         systemDraft = ""
+        realtimeAudioActivityStartedAt = nil
+        lastRealtimeTextAt = nil
+        realtimeProcessingLag = 0
+        realtimePreviewCounts = [:]
+        realtimeProcessedDurations = [:]
+        realtimeCaptureStartedAt = nil
+        didLogRealtimeLagWarning = false
         realtimeSegmenters = [:]
         phase = .idle
         preparationProgress = nil
@@ -906,12 +1111,10 @@ final class MeetingController: ObservableObject {
 
         await reloadMeetings()
         await loadSelectedMeeting()
-        if finalState == .completed {
-            NotificationCenter.default.post(
-                name: .meetingDidFinish,
-                object: meetingID
-            )
-        }
+        NotificationCenter.default.post(
+            name: .meetingDidFinish,
+            object: meetingID
+        )
         pipelineFailureMessage = nil
     }
 
@@ -968,6 +1171,89 @@ final class MeetingController: ObservableObject {
             : "\(failureCount) bloc(s) audio restent a reprendre"
     }
 
+    private func preloadTranscriptionEngines() async {
+        guard store != nil else { return }
+
+        phase = .preparing
+        status = "Chargement des modeles locaux..."
+        preparationProgress = nil
+        do {
+            _ = try await preparedTranscriptionEngines()
+            areModelsReady = true
+            phase = .idle
+            preparationProgress = nil
+            status = "Modeles locaux prets"
+            logger.info("Transcription models preloaded and retained for immediate capture")
+        } catch {
+            logger.error(
+                "Model preload failed: \(error.localizedDescription, privacy: .public)"
+            )
+            await releaseTranscriptionEngines()
+            phase = .failed(error.localizedDescription)
+            status = "Chargement des modeles locaux impossible"
+            preparationProgress = nil
+        }
+    }
+
+    private func preparedTranscriptionEngines() async throws -> (
+        FluidAudioBatchTranscriptionEngine,
+        FluidAudioRealtimePreviewEngine
+    ) {
+        let batchEngine: FluidAudioBatchTranscriptionEngine
+        if let engine {
+            batchEngine = engine
+            try await batchEngine.prepare { [weak self] engineStatus in
+                Task { @MainActor [weak self] in self?.apply(engineStatus) }
+            }
+        } else {
+            let candidate = FluidAudioBatchTranscriptionEngine(voiceProfiles: voiceProfiles)
+            do {
+                try await candidate.prepare { [weak self] engineStatus in
+                    Task { @MainActor [weak self] in self?.apply(engineStatus) }
+                }
+                engine = candidate
+                batchEngine = candidate
+            } catch {
+                await candidate.finish()
+                throw error
+            }
+        }
+        await batchEngine.replaceVoiceProfiles(voiceProfiles)
+
+        let realtimeEngine: FluidAudioRealtimePreviewEngine
+        if let previewEngine {
+            realtimeEngine = previewEngine
+            try await realtimeEngine.prepare { [weak self] engineStatus in
+                Task { @MainActor [weak self] in self?.apply(engineStatus) }
+            }
+        } else {
+            let candidate = FluidAudioRealtimePreviewEngine()
+            do {
+                try await candidate.prepare { [weak self] engineStatus in
+                    Task { @MainActor [weak self] in self?.apply(engineStatus) }
+                }
+                previewEngine = candidate
+                realtimeEngine = candidate
+            } catch {
+                await candidate.finish()
+                throw error
+            }
+        }
+
+        let isBatchReady = await batchEngine.isReady
+        let isRealtimeReady = await realtimeEngine.isReady
+        areModelsReady = isBatchReady && isRealtimeReady
+        return (batchEngine, realtimeEngine)
+    }
+
+    private func releaseTranscriptionEngines() async {
+        await previewEngine?.finish()
+        await engine?.finish()
+        previewEngine = nil
+        engine = nil
+        areModelsReady = false
+    }
+
     private func recordPipelineFailure(_ error: Error) {
         logger.error("Audio pipeline failed: \(error.localizedDescription, privacy: .public)")
         if pipelineFailureMessage == nil {
@@ -1013,10 +1299,7 @@ final class MeetingController: ObservableObject {
                 interruptionReason: error.localizedDescription
             )
         } else {
-            await previewEngine?.finish()
-            await engine?.finish()
-            previewEngine = nil
-            engine = nil
+            await releaseTranscriptionEngines()
         }
         phase = .failed(error.localizedDescription)
         status = "Demarrage impossible"
@@ -1048,6 +1331,25 @@ final class MeetingController: ObservableObject {
     private func applyLoadedSegments(_ loaded: [TranscriptSegment]) {
         segments = loaded.filter { $0.source == .canonical }
         realtimeSegments = loaded.filter { $0.source == .realtime }
+    }
+
+    private static func resumeOffset(from segments: [TranscriptSegment]) -> TimeInterval {
+        max(0, segments.map(\.endTime).max() ?? 0)
+    }
+
+    private static func offset(_ chunk: AudioChunk, by timeOffset: TimeInterval) -> AudioChunk {
+        guard timeOffset > 0 else { return chunk }
+        return AudioChunk(
+            input: chunk.input,
+            samples: chunk.samples,
+            sampleRate: chunk.sampleRate,
+            startTime: chunk.startTime + timeOffset
+        )
+    }
+
+    private static func formatTimestamp(_ seconds: TimeInterval) -> String {
+        let totalSeconds = max(0, Int(seconds.rounded(.down)))
+        return String(format: "%02d:%02d", totalSeconds / 60, totalSeconds % 60)
     }
 }
 

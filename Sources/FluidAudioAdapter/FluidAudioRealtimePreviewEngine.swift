@@ -5,6 +5,9 @@ import OSLog
 import TranscriptionCore
 
 public actor FluidAudioRealtimePreviewEngine: RealtimePreviewTranscriptionEngine {
+    /// Le tier 2,24 s est le compromis recommande par FluidAudio. Le tier
+    /// 560 ms produit plus vite son premier token, mais il ne tient pas le
+    /// temps reel sur deux flux complexes et finit par accumuler du retard.
     public static let chunkMilliseconds = 2_240
 
     private let logger = Logger(
@@ -14,12 +17,13 @@ public actor FluidAudioRealtimePreviewEngine: RealtimePreviewTranscriptionEngine
     private var sharedModels: SharedNemotronMultilingualModels?
     private var microphoneManager: StreamingNemotronMultilingualAsrManager?
     private var systemManager: StreamingNemotronMultilingualAsrManager?
-    private let microphoneClock = RealtimeAudioClock()
-    private let systemClock = RealtimeAudioClock()
+    private var activeSession: RealtimePreviewSession?
     private var isPrepared = false
     private var isStarted = false
 
     public init() {}
+
+    public var isReady: Bool { isPrepared }
 
     public func prepare(
         statusHandler: @escaping @Sendable (TranscriptionEngineStatus) -> Void
@@ -62,23 +66,13 @@ public actor FluidAudioRealtimePreviewEngine: RealtimePreviewTranscriptionEngine
         }
         guard !isStarted else { return }
 
+        let session = RealtimePreviewSession(updateHandler: updateHandler)
+        activeSession = session
         await microphoneManager.setPartialCallback { text in
-            updateHandler(
-                RealtimeTranscriptPreview(
-                    input: .microphone,
-                    text: text,
-                    processedAudioDuration: self.microphoneClock.duration
-                )
-            )
+            session.emit(text, input: .microphone)
         }
         await systemManager.setPartialCallback { text in
-            updateHandler(
-                RealtimeTranscriptPreview(
-                    input: .system,
-                    text: text,
-                    processedAudioDuration: self.systemClock.duration
-                )
-            )
+            session.emit(text, input: .system)
         }
         isStarted = true
     }
@@ -88,12 +82,28 @@ public actor FluidAudioRealtimePreviewEngine: RealtimePreviewTranscriptionEngine
         switch chunk.input {
         case .microphone:
             guard let microphoneManager else { return }
-            microphoneClock.advance(sampleCount: chunk.samples.count, sampleRate: chunk.sampleRate)
+            activeSession?.advance(
+                input: chunk.input,
+                sampleCount: chunk.samples.count,
+                sampleRate: chunk.sampleRate
+            )
             _ = try await microphoneManager.process(samples: chunk.samples)
+            activeSession?.setDetectedLanguage(
+                await microphoneManager.detectedLanguage(),
+                input: chunk.input
+            )
         case .system:
             guard let systemManager else { return }
-            systemClock.advance(sampleCount: chunk.samples.count, sampleRate: chunk.sampleRate)
+            activeSession?.advance(
+                input: chunk.input,
+                sampleCount: chunk.samples.count,
+                sampleRate: chunk.sampleRate
+            )
             _ = try await systemManager.process(samples: chunk.samples)
+            activeSession?.setDetectedLanguage(
+                await systemManager.detectedLanguage(),
+                input: chunk.input
+            )
         }
     }
 
@@ -101,65 +111,53 @@ public actor FluidAudioRealtimePreviewEngine: RealtimePreviewTranscriptionEngine
         switch input {
         case .microphone:
             await microphoneManager?.reset()
-            microphoneClock.reset()
         case .system:
             await systemManager?.reset()
-            systemClock.reset()
         }
+        activeSession?.reset(input: input)
     }
 
-    public func finish() async {
+    public func stopSession() async {
+        guard isStarted else { return }
+
+        let session = activeSession
         if let microphoneManager {
             do {
-                _ = try await microphoneManager.finish()
+                let finalText = try await microphoneManager.finish()
+                session?.emit(finalText, input: .microphone)
             } catch {
                 logger.error(
                     "Microphone preview flush failed: \(error.localizedDescription, privacy: .public)"
                 )
             }
-            await microphoneManager.cleanup()
+            await microphoneManager.reset()
         }
         if let systemManager {
             do {
-                _ = try await systemManager.finish()
+                let finalText = try await systemManager.finish()
+                session?.emit(finalText, input: .system)
             } catch {
                 logger.error(
                     "System preview flush failed: \(error.localizedDescription, privacy: .public)"
                 )
             }
-            await systemManager.cleanup()
+            await systemManager.reset()
         }
+        session?.deactivate()
+        isStarted = false
+        activeSession = nil
+    }
+
+    public func finish() async {
+        await stopSession()
+        await microphoneManager?.cleanup()
+        await systemManager?.cleanup()
         microphoneManager = nil
         systemManager = nil
         sharedModels = nil
         isPrepared = false
-        isStarted = false
-        microphoneClock.reset()
-        systemClock.reset()
-    }
-}
-
-private final class RealtimeAudioClock: @unchecked Sendable {
-    private let lock = NSLock()
-    private var sampleDuration: TimeInterval = 0
-
-    var duration: TimeInterval {
-        lock.lock()
-        defer { lock.unlock() }
-        return sampleDuration
-    }
-
-    func advance(sampleCount: Int, sampleRate: Int) {
-        guard sampleCount > 0, sampleRate > 0 else { return }
-        lock.lock()
-        sampleDuration += Double(sampleCount) / Double(sampleRate)
-        lock.unlock()
-    }
-
-    func reset() {
-        lock.lock()
-        sampleDuration = 0
-        lock.unlock()
+        activeSession?.deactivate()
+        activeSession = nil
     }
 }
 

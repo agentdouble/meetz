@@ -38,6 +38,12 @@ dans le cache local et affiche leur progression. Les lancements suivants les
 reutilisent. Un cache de diarisation interrompu est detecte et retélécharge
 automatiquement.
 
+Tous les moteurs locaux sont charges au lancement de l'application, avant la
+premiere reunion. L'etat `Modeles locaux prets` confirme que Nemotron,
+Parakeet, LS-EEND et la reconnaissance vocale sont immediatement disponibles.
+Ils restent residents en memoire entre les reunions et sont reutilises sans
+nouveau chargement ; fermer Meeting rend cette memoire a macOS.
+
 Pour conserver physiquement les modeles dans ce projet sans les publier dans
 Git, executer une fois :
 
@@ -51,17 +57,38 @@ dossier. `.models/` est ignore par Git. Sur un nouveau Mac ou un nouveau clone,
 le script cree le dossier et les modeles sont telecharges au premier lancement.
 
 Pendant une reunion, Nemotron multilingue affiche une previsualisation locale
-francaise ou anglaise environ toutes les 2,24 secondes. Ce texte en cours est
+francaise ou anglaise avec des fenetres de 2,24 secondes. Ce texte en cours est
 egalement un vrai transcript exploitable : il est decoupe en segments d'environ
 20 secondes, horodate et mis a jour dans SQLite avec la source `realtime`.
 Cette segmentation reste invisible pendant la capture : l'interface presente
 un seul texte continu avec un curseur discret, sans repeter le nom de la source
 ni l'horodatage. La vue structuree reapparait apres la consolidation finale.
-Les boutons IA peuvent donc le consommer avant la fin de la reunion. Les memes
-echantillons sont d'abord synchronises dans le journal WAV durable. Pendant la
-capture, Nemotron reste le seul moteur d'inference actif afin de conserver une latence reguliere.
-A l'arret, Nemotron libere le Neural Engine, puis Parakeet et LS-EEND consolident
-les blocs de 20 a 30 secondes en segments `canonical`. Si toute la consolidation
+Les petits buffers ScreenCaptureKit sont regroupes en paquets continus de
+100 ms avant Nemotron afin de reduire le cout des appels asynchrones sans
+modifier le journal audio original. Chaque session directe possede un identifiant
+propre afin qu'un callback ancien ne puisse pas polluer une reunion reprise.
+ScreenCaptureKit recoit aussi une sortie ecran minimale 2x2 a 1 Hz, aussitot
+ignoree et jamais stockee. Elle maintient correctement le flux de capture dont
+Meeting ne consomme que les pistes audio pendant les reunions longues.
+La file de previsualisation est bornee par canal : si une source atypique rend
+Nemotron plus lent que le temps reel, les paquets les plus anciens de l'apercu
+peuvent etre abandonnes pour rattraper le direct, sans aucune perte dans le
+journal audio integral utilise par la consolidation finale. L'interface affiche
+alors explicitement le retard mesure.
+L'affichage direct possede quatre etats
+explicites : ecoute, transcription en cours, retard et texte direct. Il utilise
+le brouillon moteur comme secours immediat, puis les segments SQLite comme
+source prioritaire, de sorte qu'une zone vide ne puisse plus masquer un moteur
+en attente ou en retard.
+Les boutons IA peuvent donc le consommer avant la fin de la reunion. Chaque paquet
+capture est duplique immediatement vers deux files independantes : Nemotron pour
+le direct et le journal WAV durable. Le journal regroupe ses ecritures par 100 ms,
+de sorte qu'un retard disque ne puisse plus retarder l'affichage. Pendant la
+capture, Nemotron reste le seul moteur a executer une inference afin de conserver
+une latence reguliere ; les autres modeles sont deja charges mais inactifs.
+A l'arret, la session Nemotron est remise a zero sans decharger ses modeles,
+puis Parakeet et LS-EEND consolident les blocs de 20 a 30 secondes en segments
+`canonical`. Si toute la consolidation
 reussit, ils remplacent atomiquement les segments directs. En cas d'echec, les
 segments Nemotron restent disponibles. Une erreur de
 previsualisation ne peut donc ni ralentir l'enregistrement ni perdre le contenu,
@@ -95,8 +122,17 @@ et separes enregistrent le microphone et le son du Mac. Ils sont fermes par
 blocs de 20 a 30 secondes, transcrits en batch puis supprimes uniquement apres
 la transaction SQLite. Un bloc interrompu est repris au lancement suivant.
 
+Une reunion terminee peut aussi etre reprise depuis son transcript avec le
+bouton `Reprendre`. Les nouveaux segments sont ajoutes a la meme reunion et
+leurs horodatages continuent apres le dernier segment existant. Pendant cette
+reprise, l'ancien transcript reste visible au-dessus du nouveau texte direct ;
+le chat Codex conserve donc le contexte et son historique de conversation.
+
 Parakeet est utilise sans filtre de rejet anglais : les dialogues francais et
-anglais passent par le meme chemin local. Le controle reel correspondant est :
+anglais passent par le meme chemin local et restent dans leur langue source.
+Nemotron utilise egalement la detection automatique ; aucune etape du transcript
+ne demande de traduction. Une future traduction en direct devra etre une option
+explicite, distincte du texte original. Le controle reel correspondant est :
 
 ```bash
 ./scripts/check-batch.sh
@@ -110,6 +146,12 @@ fermeture des flux :
 ./scripts/check-realtime.sh
 ```
 
+Le panneau complet du transcript peut etre ferme pendant l'enregistrement depuis
+les reglages ou son action de reduction. Il est remplace par une carte compacte
+avec l'etat de capture et les niveaux MIC/MAC. Ce choix ne desactive ni la
+transcription, ni sa sauvegarde locale, ni son exploitation par Codex. Le panneau
+et le transcript consolide reapparaissent normalement apres l'arret.
+
 ## Intelligence artificielle avec Codex
 
 La roue crantee ouvre les reglages IA : modele Codex, effort de raisonnement,
@@ -121,6 +163,10 @@ reunion : proposer un titre si le titre par defaut n'a jamais ete modifie, puis
 generer un resume. Un chat integre a droite permet ensuite de discuter librement
 avec le transcript selectionne. Ses raccourcis produisent un resume, des
 prochaines etapes, des questions a poser ou les problemes restant a resoudre.
+
+Les titres sont prioritaires dans la file. Un transcript vide ne bloque jamais
+les traitements suivants et, au lancement, l'application rattrape les reunions
+qui possedent du texte mais conservent encore leur titre automatique.
 
 Chaque traitement transmet uniquement l'export JSON versionne du transcript a
 `codex exec`, dans un dossier temporaire et une sandbox en lecture seule. La
