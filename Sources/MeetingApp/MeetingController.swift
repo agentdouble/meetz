@@ -17,6 +17,8 @@ final class MeetingController: ObservableObject {
     }
 
     private let logger = Logger(subsystem: "com.jeremy.meeting", category: "MeetingController")
+    private let audioLevelCoalescer = AudioLevelCoalescer(updatesPerSecond: 10)
+    private let audioProgressCoalescer = AudioProgressCoalescer(updatesPerSecond: 2)
 
     enum Phase: Equatable {
         case idle
@@ -74,6 +76,7 @@ final class MeetingController: ObservableObject {
     private var realtimeProcessedDurations: [AudioInputKind: TimeInterval] = [:]
     private var realtimeCaptureStartedAt: Date?
     private var didLogRealtimeLagWarning = false
+    private var loggedAudioLevelBuckets: [AudioInputKind: UInt64] = [:]
 
     init(
         captureSource: any AudioCaptureSource = ScreenCaptureAudioSource()
@@ -179,6 +182,9 @@ final class MeetingController: ObservableObject {
         realtimeProcessedDurations = [:]
         realtimeCaptureStartedAt = nil
         didLogRealtimeLagWarning = false
+        loggedAudioLevelBuckets = [:]
+        audioLevelCoalescer.cancel()
+        audioProgressCoalescer.cancel()
         realtimeSegments = []
         if meetingToResume == nil {
             segments = []
@@ -230,11 +236,21 @@ final class MeetingController: ObservableObject {
                     timeOffset: timeOffset
                 )
 
+                let audioLevelCoalescer = self.audioLevelCoalescer
+                let audioProgressCoalescer = self.audioProgressCoalescer
                 try await captureSource.start { [weak self] event in
                     switch event {
                     case let .samples(chunk):
                         audioFanout.yield(chunk)
-                    case .level, .stopped:
+                    case let .level(snapshot):
+                        audioLevelCoalescer.submit(snapshot) { [weak self] snapshots in
+                            Task { @MainActor [weak self] in
+                                self?.acceptAudioLevels(snapshots)
+                            }
+                        }
+                    case .stopped:
+                        audioLevelCoalescer.cancel()
+                        audioProgressCoalescer.cancel()
                         Task { @MainActor [weak self] in
                             self?.acceptCaptureEvent(event)
                         }
@@ -262,6 +278,9 @@ final class MeetingController: ObservableObject {
         status = "Parlez naturellement pendant quelques secondes..."
         voiceEnrollmentProgress = 0
         microphoneLevel = 0
+        loggedAudioLevelBuckets = [:]
+        audioLevelCoalescer.cancel()
+        audioProgressCoalescer.cancel()
         let collector = VoiceEnrollmentSession()
         let (stream, continuation) = AsyncStream<AudioChunk>.makeStream(
             bufferingPolicy: .bufferingNewest(256)
@@ -270,14 +289,22 @@ final class MeetingController: ObservableObject {
 
         enrollmentTask = Task {
             do {
+                let audioLevelCoalescer = self.audioLevelCoalescer
+                let audioProgressCoalescer = self.audioProgressCoalescer
                 try await captureSource.start { [weak self] event in
                     switch event {
                     case let .samples(chunk) where chunk.input == .microphone:
                         continuation.yield(chunk)
-                    case .level, .stopped:
-                        if case .stopped = event {
-                            continuation.finish()
+                    case let .level(snapshot):
+                        audioLevelCoalescer.submit(snapshot) { [weak self] snapshots in
+                            Task { @MainActor [weak self] in
+                                self?.acceptAudioLevels(snapshots)
+                            }
                         }
+                    case .stopped:
+                        audioLevelCoalescer.cancel()
+                        audioProgressCoalescer.cancel()
+                        continuation.finish()
                         Task { @MainActor [weak self] in
                             self?.acceptCaptureEvent(event)
                         }
@@ -295,6 +322,8 @@ final class MeetingController: ObservableObject {
                 }
 
                 try Task.checkCancellation()
+                audioLevelCoalescer.cancel()
+                audioProgressCoalescer.cancel()
                 await captureSource.stop()
                 continuation.finish()
 
@@ -488,6 +517,8 @@ final class MeetingController: ObservableObject {
         guard phase == .recording else { return }
         phase = .stopping
         status = "Finalisation des derniers mots..."
+        audioLevelCoalescer.cancel()
+        audioProgressCoalescer.cancel()
 
         Task {
             await captureSource.stop()
@@ -569,20 +600,7 @@ final class MeetingController: ObservableObject {
     private func acceptCaptureEvent(_ event: AudioCaptureEvent) {
         switch event {
         case let .level(snapshot):
-            if snapshot.bufferCount.isMultiple(of: 250) {
-                logger.info(
-                    "Audio input active input=\(snapshot.input.rawValue, privacy: .public) buffers=\(snapshot.bufferCount, privacy: .public) level=\(String(format: "%.4f", snapshot.linearLevel), privacy: .public)"
-                )
-            }
-            switch snapshot.input {
-            case .microphone:
-                microphoneLevel = snapshot.linearLevel
-            case .system:
-                systemLevel = snapshot.linearLevel
-            }
-            if snapshot.linearLevel >= 0.008, realtimeAudioActivityStartedAt == nil {
-                realtimeAudioActivityStartedAt = Date()
-            }
+            acceptAudioLevels([snapshot])
         case let .stopped(reason):
             logger.error(
                 "Capture source stopped phase=\(String(describing: self.phase), privacy: .public) reason=\(reason, privacy: .public)"
@@ -599,6 +617,28 @@ final class MeetingController: ObservableObject {
             }
         case .samples:
             break
+        }
+    }
+
+    private func acceptAudioLevels(_ snapshots: [AudioLevelSnapshot]) {
+        guard phase == .recording || phase == .enrolling else { return }
+        for snapshot in snapshots {
+            let logBucket = snapshot.bufferCount / 250
+            if logBucket > loggedAudioLevelBuckets[snapshot.input, default: 0] {
+                loggedAudioLevelBuckets[snapshot.input] = logBucket
+                logger.info(
+                    "Audio input active input=\(snapshot.input.rawValue, privacy: .public) buffers=\(snapshot.bufferCount, privacy: .public) level=\(String(format: "%.4f", snapshot.linearLevel), privacy: .public)"
+                )
+            }
+            switch snapshot.input {
+            case .microphone:
+                microphoneLevel = snapshot.linearLevel
+            case .system:
+                systemLevel = snapshot.linearLevel
+            }
+            if snapshot.linearLevel >= 0.008, realtimeAudioActivityStartedAt == nil {
+                realtimeAudioActivityStartedAt = Date()
+            }
         }
     }
 
@@ -793,6 +833,7 @@ final class MeetingController: ObservableObject {
         )
         let deferredAudioBlockQueue = DeferredAudioBlockQueue()
         let previewDropCounter = AudioChunkDropCounter()
+        let audioProgressCoalescer = self.audioProgressCoalescer
 
         microphoneAudioContinuation = microphoneContinuation
         systemAudioContinuation = systemContinuation
@@ -800,92 +841,54 @@ final class MeetingController: ObservableObject {
         self.systemPreviewContinuation = systemPreviewContinuation
         self.deferredAudioBlockQueue = deferredAudioBlockQueue
 
-        microphoneJournalTask = Task { [weak self] in
-            var batcher = RealtimeAudioChunkBatcher()
-            for await chunk in microphoneStream {
-                for batch in batcher.append(chunk) {
-                    await self?.appendToJournal(
-                        batch,
-                        meetingID: meetingID,
-                        timeOffset: timeOffset,
-                        journal: journal,
-                        deferredQueue: deferredAudioBlockQueue
-                    )
-                }
-            }
-            if let remainder = batcher.finish() {
-                await self?.appendToJournal(
-                    remainder,
-                    meetingID: meetingID,
-                    timeOffset: timeOffset,
-                    journal: journal,
-                    deferredQueue: deferredAudioBlockQueue
-                )
+        microphoneJournalTask = Task.detached(priority: .userInitiated) { [weak self] in
+            await MeetingAudioPipelineWorker.runJournal(
+                stream: microphoneStream,
+                meetingID: meetingID,
+                timeOffset: timeOffset,
+                journal: journal,
+                deferredQueue: deferredAudioBlockQueue
+            ) { [weak self] error in
+                await self?.recordPipelineFailure(error)
             }
         }
-        systemJournalTask = Task { [weak self] in
-            var batcher = RealtimeAudioChunkBatcher()
-            for await chunk in systemStream {
-                for batch in batcher.append(chunk) {
-                    await self?.appendToJournal(
-                        batch,
-                        meetingID: meetingID,
-                        timeOffset: timeOffset,
-                        journal: journal,
-                        deferredQueue: deferredAudioBlockQueue
-                    )
-                }
-            }
-            if let remainder = batcher.finish() {
-                await self?.appendToJournal(
-                    remainder,
-                    meetingID: meetingID,
-                    timeOffset: timeOffset,
-                    journal: journal,
-                    deferredQueue: deferredAudioBlockQueue
-                )
+        systemJournalTask = Task.detached(priority: .userInitiated) { [weak self] in
+            await MeetingAudioPipelineWorker.runJournal(
+                stream: systemStream,
+                meetingID: meetingID,
+                timeOffset: timeOffset,
+                journal: journal,
+                deferredQueue: deferredAudioBlockQueue
+            ) { [weak self] error in
+                await self?.recordPipelineFailure(error)
             }
         }
-        microphonePreviewTask = Task { [weak self] in
-            var batcher = RealtimeAudioChunkBatcher()
-            for await chunk in microphonePreviewStream {
-                for batch in batcher.append(chunk) {
-                    do {
-                        try await previewEngine.ingest(batch)
-                        self?.acceptRealtimeProgress(batch)
-                    } catch {
-                        self?.recordPreviewFailure(error)
+        microphonePreviewTask = Task.detached(priority: .userInitiated) { [weak self] in
+            await MeetingAudioPipelineWorker.runPreview(
+                stream: microphonePreviewStream,
+                engine: previewEngine
+            ) { [weak self] progress in
+                audioProgressCoalescer.submit(progress) { [weak self] progressSnapshots in
+                    Task { @MainActor [weak self] in
+                        self?.acceptRealtimeProgress(progressSnapshots)
                     }
                 }
-            }
-            if let remainder = batcher.finish() {
-                do {
-                    try await previewEngine.ingest(remainder)
-                    self?.acceptRealtimeProgress(remainder)
-                } catch {
-                    self?.recordPreviewFailure(error)
-                }
+            } onFailure: { [weak self] error in
+                await self?.recordPreviewFailure(error)
             }
         }
-        systemPreviewTask = Task { [weak self] in
-            var batcher = RealtimeAudioChunkBatcher()
-            for await chunk in systemPreviewStream {
-                for batch in batcher.append(chunk) {
-                    do {
-                        try await previewEngine.ingest(batch)
-                        self?.acceptRealtimeProgress(batch)
-                    } catch {
-                        self?.recordPreviewFailure(error)
+        systemPreviewTask = Task.detached(priority: .userInitiated) { [weak self] in
+            await MeetingAudioPipelineWorker.runPreview(
+                stream: systemPreviewStream,
+                engine: previewEngine
+            ) { [weak self] progress in
+                audioProgressCoalescer.submit(progress) { [weak self] progressSnapshots in
+                    Task { @MainActor [weak self] in
+                        self?.acceptRealtimeProgress(progressSnapshots)
                     }
                 }
-            }
-            if let remainder = batcher.finish() {
-                do {
-                    try await previewEngine.ingest(remainder)
-                    self?.acceptRealtimeProgress(remainder)
-                } catch {
-                    self?.recordPreviewFailure(error)
-                }
+            } onFailure: { [weak self] error in
+                await self?.recordPreviewFailure(error)
             }
         }
 
@@ -920,12 +923,13 @@ final class MeetingController: ObservableObject {
         )
     }
 
-    private func acceptRealtimeProgress(_ chunk: AudioChunk) {
-        let processedDuration = max(0, chunk.startTime + chunk.duration)
-        realtimeProcessedDurations[chunk.input] = max(
-            realtimeProcessedDurations[chunk.input, default: 0],
-            processedDuration
-        )
+    private func acceptRealtimeProgress(_ progressSnapshots: [AudioProcessingProgress]) {
+        for progress in progressSnapshots {
+            realtimeProcessedDurations[progress.input] = max(
+                realtimeProcessedDurations[progress.input, default: 0],
+                progress.processedDuration
+            )
+        }
         guard let realtimeCaptureStartedAt else { return }
 
         let captureDuration = Date().timeIntervalSince(realtimeCaptureStartedAt)
@@ -951,22 +955,6 @@ final class MeetingController: ObservableObject {
         )
         if phase == .recording {
             status = "Direct en retard · audio integral protege pour la consolidation"
-        }
-    }
-
-    private func appendToJournal(
-        _ chunk: AudioChunk,
-        meetingID: UUID,
-        timeOffset: TimeInterval,
-        journal: DurableAudioJournal,
-        deferredQueue: DeferredAudioBlockQueue
-    ) async {
-        do {
-            let journalChunk = Self.offset(chunk, by: timeOffset)
-            let blocks = try await journal.append(journalChunk, meetingID: meetingID)
-            await deferredQueue.enqueue(contentsOf: blocks)
-        } catch {
-            recordPipelineFailure(error)
         }
     }
 
@@ -1085,6 +1073,8 @@ final class MeetingController: ObservableObject {
         }
 
         currentMeeting = nil
+        audioLevelCoalescer.cancel()
+        audioProgressCoalescer.cancel()
         microphoneLevel = 0
         systemLevel = 0
         microphoneDraft = ""
@@ -1291,6 +1281,8 @@ final class MeetingController: ObservableObject {
 
     private func failCurrentMeeting(_ error: Error) async {
         logger.error("Meeting start failed: \(error.localizedDescription, privacy: .public)")
+        audioLevelCoalescer.cancel()
+        audioProgressCoalescer.cancel()
         await captureSource.stop()
         if currentMeeting != nil {
             recordPipelineFailure(error)
@@ -1335,16 +1327,6 @@ final class MeetingController: ObservableObject {
 
     private static func resumeOffset(from segments: [TranscriptSegment]) -> TimeInterval {
         max(0, segments.map(\.endTime).max() ?? 0)
-    }
-
-    private static func offset(_ chunk: AudioChunk, by timeOffset: TimeInterval) -> AudioChunk {
-        guard timeOffset > 0 else { return chunk }
-        return AudioChunk(
-            input: chunk.input,
-            samples: chunk.samples,
-            sampleRate: chunk.sampleRate,
-            startTime: chunk.startTime + timeOffset
-        )
     }
 
     private static func formatTimestamp(_ seconds: TimeInterval) -> String {

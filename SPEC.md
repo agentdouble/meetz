@@ -337,6 +337,15 @@ Obsidian reste un ensemble de notes Markdown structurees. Une vue Obsidian Bases
 - Les prompts du chat et des traitements structures exigent l'attribution par `speakerName`, conservent les etiquettes generiques et interdisent d'inventer une identite.
 - Le controle reel du runner utilise Alice et Bob et refuse la reponse si Codex n'attribue pas explicitement le budget a Alice.
 
+### Isolation du chat et du pipeline audio implementee le 2026-08-26
+
+- Ouvrir le chat ou attendre une reponse Codex pendant une capture ne doit jamais interrompre le journal audio ni la transcription directe.
+- Les consommateurs du journal durable et de la previsualisation Nemotron s'executent dans des taches detachees de l'acteur UI.
+- Les niveaux MIC/MAC sont regroupes hors du `MainActor` et publies au maximum dix fois par seconde ; seuls les derniers niveaux visuels sont remplaces, jamais les echantillons audio.
+- La progression du moteur direct est publiee au maximum deux fois par seconde sans attente du `MainActor` ; le calcul visuel du retard ne peut donc pas retenir l'inference.
+- Les files de journal restent sans perte et independantes des files de previsualisation bornees. Une surcharge du direct reste visible et recuperable par consolidation sans perte audio.
+- Un controle de concurrence injecte mille niveaux puis mille progressions rapproches et verifie une livraison UI unique contenant la valeur la plus recente de chaque entree, ainsi que l'annulation des livraisons d'une ancienne capture.
+
 ### Reprise d'une reunion terminee implementee le 2026-08-26
 
 - Le bouton `Reprendre` rouvre atomiquement la reunion selectionnee au lieu de creer un second transcript.

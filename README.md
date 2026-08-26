@@ -164,6 +164,13 @@ generer un resume. Un chat integre a droite permet ensuite de discuter librement
 avec le transcript selectionne. Ses raccourcis produisent un resume, des
 prochaines etapes, des questions a poser ou les problemes restant a resoudre.
 
+Le chat reste utilisable pendant une reunion sans ralentir la capture. Le
+journal audio durable et la transcription directe travaillent hors du
+`MainActor`, tandis que les niveaux MIC/MAC tres frequents sont regroupes a
+10 mises a jour UI par seconde et la progression ASR a 2. La charge de rendu
+du panneau Codex ne peut donc pas bloquer les consommateurs audio ; les
+echantillons ne passent jamais par ces regroupements visuels.
+
 Les titres sont prioritaires dans la file. Un transcript vide ne bloque jamais
 les traitements suivants et, au lancement, l'application rattrape les reunions
 qui possedent du texte mais conservent encore leur titre automatique.

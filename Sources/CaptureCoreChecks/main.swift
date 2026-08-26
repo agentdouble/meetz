@@ -27,6 +27,40 @@ private final class LockedFanoutRecorder: @unchecked Sendable {
     }
 }
 
+private final class LockedAudioLevelRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var batches: [[AudioLevelSnapshot]] = []
+
+    func record(_ snapshots: [AudioLevelSnapshot]) {
+        lock.lock()
+        batches.append(snapshots)
+        lock.unlock()
+    }
+
+    func recordedBatches() -> [[AudioLevelSnapshot]] {
+        lock.lock()
+        defer { lock.unlock() }
+        return batches
+    }
+}
+
+private final class LockedAudioProgressRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var batches: [[AudioProcessingProgress]] = []
+
+    func record(_ snapshots: [AudioProcessingProgress]) {
+        lock.lock()
+        batches.append(snapshots)
+        lock.unlock()
+    }
+
+    func recordedBatches() -> [[AudioProcessingProgress]] {
+        lock.lock()
+        defer { lock.unlock() }
+        return batches
+    }
+}
+
 private func expect(
     _ condition: @autoclosure () -> Bool,
     _ message: String
@@ -65,6 +99,78 @@ do {
     try expect(
         AudioMath.meterLevel(fromRootMeanSquare: 10) == 1,
         "Le vumetre doit borner les niveaux superieurs a un"
+    )
+
+    let levelCoalescer = AudioLevelCoalescer(updatesPerSecond: 30)
+    let levelRecorder = LockedAudioLevelRecorder()
+    for count in 1...500 {
+        levelCoalescer.submit(
+            AudioLevelSnapshot(
+                input: .microphone,
+                linearLevel: Double(count) / 500,
+                bufferCount: UInt64(count)
+            ),
+            handler: levelRecorder.record
+        )
+        levelCoalescer.submit(
+            AudioLevelSnapshot(
+                input: .system,
+                linearLevel: Double(count) / 1_000,
+                bufferCount: UInt64(count)
+            ),
+            handler: levelRecorder.record
+        )
+    }
+    try await Task.sleep(for: .milliseconds(80))
+    let coalescedLevelBatches = levelRecorder.recordedBatches()
+    try expect(
+        coalescedLevelBatches.count == 1,
+        "Mille niveaux rapproches doivent produire une seule livraison UI"
+    )
+    try expect(
+        coalescedLevelBatches[0].first { $0.input == .microphone }?.bufferCount == 500
+            && coalescedLevelBatches[0].first { $0.input == .system }?.bufferCount == 500,
+        "Le coalescer doit livrer le niveau le plus recent de chaque entree"
+    )
+    levelCoalescer.submit(
+        AudioLevelSnapshot(input: .microphone, linearLevel: 1, bufferCount: 501),
+        handler: levelRecorder.record
+    )
+    levelCoalescer.cancel()
+    try await Task.sleep(for: .milliseconds(80))
+    try expect(
+        levelRecorder.recordedBatches().count == 1,
+        "Une livraison invalidee ne doit pas contaminer la capture suivante"
+    )
+
+    let progressCoalescer = AudioProgressCoalescer(updatesPerSecond: 30)
+    let progressRecorder = LockedAudioProgressRecorder()
+    for count in 1...500 {
+        progressCoalescer.submit(
+            AudioProcessingProgress(
+                input: .microphone,
+                processedDuration: Double(count) / 10
+            ),
+            handler: progressRecorder.record
+        )
+        progressCoalescer.submit(
+            AudioProcessingProgress(
+                input: .system,
+                processedDuration: Double(count) / 20
+            ),
+            handler: progressRecorder.record
+        )
+    }
+    try await Task.sleep(for: .milliseconds(80))
+    let coalescedProgressBatches = progressRecorder.recordedBatches()
+    try expect(
+        coalescedProgressBatches.count == 1,
+        "Mille progressions ASR ne doivent produire qu'une livraison UI"
+    )
+    try expect(
+        coalescedProgressBatches[0].first { $0.input == .microphone }?.processedDuration == 50
+            && coalescedProgressBatches[0].first { $0.input == .system }?.processedDuration == 25,
+        "Le coalescer doit conserver la progression ASR la plus recente"
     )
 
     var resumedSegmenter = RealtimeTranscriptSegmenter(
